@@ -468,7 +468,7 @@ let instantiate read_propagators fs gts =
   List.rev_append implied (List.rev_append eqs fs2), gts2
 
 let add_terms fs gts =
-  if not !Config.smtpatterns && !Config.instantiate then fs else
+  if !Config.instantiate then fs else
   (*let gts_fs = ground_terms (mk_and fs) in*)
   let extra_gts = (*TermSet.diff gts gts_fs*) gts in
   let fs1 = 
@@ -478,7 +478,25 @@ let add_terms fs gts =
       | srt ->
           mk_pred ("inst-closure", 0) [t] :: fs1)
       extra_gts fs
-  in fs1
+  in
+  let rec add_guard = function
+    | Binder (b, sid_list, f, anns) ->
+        let bound_vars = sid_list
+          |> List.fold_left (fun s (i, _) -> IdSet.add i s) IdSet.empty in
+        let terms = fun_terms_with_vars f |> TermSet.elements
+          |> List.filter (fun t -> IdSet.subset (fv_term t) bound_vars) in
+        let terms = (List.map (fun (i, s) -> Var (i, s)) sid_list) @ terms in
+        let guard = mk_and
+          (List.map (fun t -> mk_pred ("inst-closure", 0) [t]) terms)
+        in
+        let f = add_guard f in
+        let f1 = mk_implies guard f in
+        Binder (b, sid_list, f1, anns)
+    | BoolOp (bo, fs) ->
+      BoolOp (bo, List.map add_guard fs)
+    | f -> f
+  in
+  List.map add_guard fs1
 
 let encode_labels fs =
   let mk_label annots f = 
@@ -533,7 +551,7 @@ let add_split_lemmas fs gts =
     
 (** Reduces the given formula to the target theory fragment, as specified by the configuration. *)
 let reduce f =
-  (* split f into conjuncts and eliminate all existential quantifiers *)
+  (* split f into conjuncts and eliminate all existential quantifiers and annots *)
   let rec split_ands acc = function
     | BoolOp(And, fs) :: gs -> 
         split_ands acc (fs @ gs)

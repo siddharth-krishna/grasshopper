@@ -738,7 +738,7 @@ let smtlib_form_of_grass_form solver_info signs f =
       | Exists -> SmtLibSyntax.Exists
       in
       let f =
-        if not !Config.smtpatterns && !Config.instantiate || TermSet.is_empty patterns
+        if not !Config.smtpatterns || TermSet.is_empty patterns
         then SmtLibSyntax.mk_binder b vs (cform f)
         else
           let annot =
