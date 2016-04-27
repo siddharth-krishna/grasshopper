@@ -129,6 +129,8 @@ let ematch filters t rep_terms egraph subst_maps =
   let subst_maps1 = ematches [t] terms subst_maps in
   List.filter (fun sm -> filter_term filters (subst_term sm t) sm) subst_maps1 
 
+let generated_terms = Hashtbl.create 0
+
 let generate_terms generators ground_terms =
   let rec add_terms new_terms t =
     if TermSet.mem t new_terms then new_terms else
@@ -207,7 +209,10 @@ let generate_terms generators ground_terms =
         then generate (round + 1) new_terms new_terms generators
         else new_terms
   in
-  generate 0 new_terms ground_terms generators
+  let new_terms = generate 0 new_terms ground_terms generators in
+  TermSet.iter (fun t -> Hashtbl.replace generated_terms t 0) (TermSet.diff new_terms ground_terms);
+  (* Printf.printf "Added %d generated terms\n" (TermSet.cardinal (TermSet.diff new_terms ground_terms)); *)
+  new_terms
 
 
 let generate_instances useLocalInst axioms rep_terms egraph = 

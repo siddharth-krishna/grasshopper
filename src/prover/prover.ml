@@ -17,6 +17,29 @@ let dump_model session f =
     close_out model_chan;
   end
 
+let analyse_core core =
+  let num_terms = Hashtbl.length InstGen.generated_terms in
+  let terms_used = Hashtbl.create 0 in
+  let check_term t =
+    if Hashtbl.mem InstGen.generated_terms t then
+      Hashtbl.replace terms_used t 0
+  in
+  let rec process_form = function
+    | Atom (t, _) -> process_term t
+    | BoolOp (_, fs) -> process_forms fs
+    | Binder (_, _, f, _) -> process_form f
+  and process_term = function
+    | App (_, ts, _) as t -> check_term t; process_terms ts
+    | t -> check_term t
+  and process_terms ts = List.iter process_term ts
+  and process_forms fs = List.iter process_form fs in
+
+  process_forms core;
+
+  Printf.printf "-----------\nCore contained %d/%d generated terms\n"
+    (Hashtbl.length terms_used) num_terms;
+  Hashtbl.iter (fun t _ -> Printf.printf "  %s\n" (string_of_term t)) terms_used
+
 let dump_core session =
   if !Config.unsat_cores then
     begin
@@ -36,6 +59,7 @@ let dump_core session =
       in
       let core = Opt.get (SmtLibSolver.get_unsat_core session) in
       let core = minimize core in
+      analyse_core core;
       let config = !Config.dump_smt_queries in
       Config.dump_smt_queries := true;
       let s = SmtLibSolver.start core_name session.SmtLibSolver.sat_means in
@@ -47,6 +71,7 @@ let dump_core session =
     end
 
 let print_query name sat_means f =
+  Hashtbl.clear InstGen.generated_terms;
   let f_inst = Reduction.reduce f in
   let f_inst =
     if !Config.named_assertions then
