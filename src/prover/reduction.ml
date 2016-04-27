@@ -547,6 +547,23 @@ let reduce f =
   let fs = split_ands [] [f1] in
   (* *)
   let fs = elim_exists fs in
+  (* print_endline "\n----------\nForms with ErrorMsg";
+  let rec form_has_annot = function
+    | (Atom (_, anns)) as f ->
+      if List.exists (function | Label ("VCLabel", _) -> true | _ -> false) anns then
+        print_endline ((string_of_form f) ^ "\n--")
+    | (Binder (_, _, fs, anns)) as f ->
+      if List.exists (function | Label ("VCLabel", _) -> true | _ -> false) anns then
+      (* if List.length anns > 0 then *)
+        print_endline ((string_of_form f) ^ "\n--")
+      else
+        form_has_annot fs
+    | BoolOp (_, fs) ->
+      List.iter form_has_annot fs
+  in
+  List.iter form_has_annot fs;
+  print_endline "------------\n"; *)
+
   (* no reduction step should introduce implicit or explicit existential quantifiers after this point *)
   (* some formula rewriting that helps the SMT solver *)
   let fs = massage_field_reads fs in

@@ -61,7 +61,7 @@ let annotate_aux_msg msg f =
 let add_labels vc =
   let process_annot (ltop, annots) = function
     | ErrorMsg (pos, msg) ->
-        let lbl = fresh_ident "Label" in
+        let lbl = fresh_ident "VCLabel" in
         IdMap.add lbl (pos, msg) ltop, 
         Label lbl :: annots 
     | ann -> ltop, ann :: annots
