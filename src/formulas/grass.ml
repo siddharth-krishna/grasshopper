@@ -153,7 +153,7 @@ type filter =
 (** matching guards for term generators *)
 type guard =
   | Match of term * filter list
-        
+
 (** annotations *)
 type annot =
   | Comment of string
@@ -161,7 +161,7 @@ type annot =
   | ErrorMsg of source_position * string
   | Label of ident
   | Name of ident
-  | TermGenerator of guard list * term list
+  | TermGenerator of guard list * term list * bool (* bool = is user defined *)
   | Pattern of term * filter list
         
 (** Boolean operators *)
@@ -396,7 +396,7 @@ let rec extract_label = function
   | [] -> None
 
 let rec extract_gens = function
-  | TermGenerator (ms, ts) :: ann ->
+  | TermGenerator (ms, ts, _) :: ann ->
       (List.map (function Match (t, f) -> t, f) ms, ts) :: extract_gens ann
   | _ :: ann -> extract_gens ann
   | [] -> []

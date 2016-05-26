@@ -134,6 +134,7 @@ let generate_terms generators ground_terms =
     if TermSet.mem t new_terms then new_terms else
     match t with
     | App (sym, ts, _) ->
+        (* Printf.printf "      Added %s\n" (string_of_term t); *)
         List.fold_left add_terms (TermSet.add t new_terms) ts
     | Var _ -> failwith ("InstGen.generate_terms: ground term expected, found "  ^ (string_of_term t))
   in
@@ -195,7 +196,7 @@ let generate_terms generators ground_terms =
               List.fold_left
                 (fun acc gen_term ->
                   let t = subst_term sm gen_term in
-                  (*let _ = print_endline ("  Adding generated term " ^ string_of_term t) in *)
+                  (*let _ = print_endline ("    Generated term " ^ string_of_term t) in*)
                   add_terms acc t)
                 acc gen_terms
             )

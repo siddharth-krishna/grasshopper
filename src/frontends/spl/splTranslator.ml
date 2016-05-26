@@ -378,7 +378,7 @@ let convert cu =
         (*let filter id sm =
            
         in*)
-        let matches = 
+        let matches =
           List.fold_right (fun (e, filters) matches -> 
             let ce = GrassUtil.free_consts_term e in
             let ce_occur_below ts =
@@ -407,7 +407,7 @@ let convert cu =
             in
             Match (e, flt) :: aux_matches @ matches) es1 []
         in
-        GrassUtil.annotate f [TermGenerator (matches, [ge1])]
+        GrassUtil.annotate f [TermGenerator (matches, [ge1], true)]
     | e ->
         let t = convert_term locals e in
         Grass.Atom (t, [SrcPos (pos_of_expr e)])

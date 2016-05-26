@@ -71,7 +71,7 @@ let add_ghost_field_invariants prog =
     let pred_id = fresh_ident "ghost_field_invariant" in
     let name = "ghost field invariant for " ^ string_of_ident decl.var_name in
     let pred_term = mk_free_app Bool pred_id [fld; alloc_set] in
-    let gen = TermGenerator ([Match (pred_term, [])], [mk_known pred_term]) in
+    let gen = TermGenerator ([Match (pred_term, [])], [mk_known pred_term], false) in
     let body = mk_spec_form (FOL (annotate body_form [gen])) name None (decl.var_pos) in
     let contract =
       { contr_name = pred_id;
@@ -162,9 +162,9 @@ let elim_arrays prog =
   in
   let compile_annot =
     function
-    | TermGenerator (gs, ts) ->
+    | TermGenerator (gs, ts, ud) ->
         let gs1 = List.map (function Match (t, f) -> Match (compile_term t, f)) gs in
-        TermGenerator (gs1, List.map compile_term ts)
+        TermGenerator (gs1, List.map compile_term ts, ud)
     | a -> a
   in
   let rec compile_grass_form = function

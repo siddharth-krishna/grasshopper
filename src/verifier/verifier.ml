@@ -120,7 +120,7 @@ let add_pred_insts prog f =
     let mt, kgen = match returns with
     | [] ->
         let mt = mk_free_fun Bool name pvs in
-        mt, [TermGenerator ([Match (mt, [])], [mk_known mt])]
+        mt, [TermGenerator ([Match (mt, [])], [mk_known mt], false)]
     | [x] ->
         let var = IdMap.find x locals in
         mk_free_fun var.var_sort name pvs, []
@@ -130,7 +130,7 @@ let add_pred_insts prog f =
     let rec add_match = function
       | Binder (b, vs, f, annots) ->
           let annots1 =
-            List.map (function TermGenerator (ms, ts) -> TermGenerator (m :: ms, ts) | a -> a) annots
+            List.map (function TermGenerator (ms, ts, ud) -> TermGenerator (m :: ms, ts, ud) | a -> a) annots
           in
           Binder (b, vs, add_match f, annots1)
       | BoolOp (op, fs) ->
@@ -157,7 +157,7 @@ let add_pred_insts prog f =
           let generators =
             (match ft with
             | [] -> []
-            | _ -> [TermGenerator ([m], ft)])
+            | _ -> [TermGenerator ([m], ft, false)])
             @ kgen              
           in
           Binder (Forall, vs, add_generators bvs f, generators @ ann)

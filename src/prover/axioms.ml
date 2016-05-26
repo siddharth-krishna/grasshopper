@@ -64,7 +64,7 @@ let mk_axiom ?(gen=[]) name f =
   let bvars = sorted_free_vars f in
   let annots = 
     Name (name, 0) :: 
-    List.map (fun (m, g) -> TermGenerator (m, g)) gen 
+    List.map (fun (m, g) -> TermGenerator (m, g, false)) gen
   in
   mk_forall ~ann:annots (IdSrtSet.elements bvars) f 
 
@@ -603,4 +603,3 @@ let set_axioms elem_srts =
   in
   Util.flat_map mk_set_axioms elem_srts
       
-

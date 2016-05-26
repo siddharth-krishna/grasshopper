@@ -634,9 +634,9 @@ let fold_terms fn init f =
 let map_terms fn f =
   let ma a =
      List.map (function
-       | TermGenerator (gs, ts) ->
+       | TermGenerator (gs, ts, ud) ->
            let gs1 = List.map (function Match (t, f) -> Match (fn t, f)) gs in
-           TermGenerator (gs1, List.map fn ts)
+           TermGenerator (gs1, List.map fn ts, ud)
        | Pattern (t, ft) -> Pattern (fn t, ft)
        | a -> a) a
   in
@@ -919,8 +919,8 @@ let subst_id subst_map f =
       Match (t1, fs1)
   in
   let suba a = match a with
-    | TermGenerator (guards, gen_terms) -> 
-        TermGenerator (List.map subg guards, List.map subt gen_terms)
+    | TermGenerator (guards, gen_terms, ud) ->
+        TermGenerator (List.map subg guards, List.map subt gen_terms, ud)
     | Pattern (t, fs) -> Pattern (subt t, List.map subf fs)
     | a -> a
   in
@@ -966,7 +966,7 @@ let subst_consts subst_map f =
     | f -> f
   in
   let subst_annot = function
-    | TermGenerator (guards, gen_terms) -> 
+    | TermGenerator (guards, gen_terms, ud) ->
         let sign, guards1 = 
           List.fold_right 
             (fun m (sign, guards1) -> 
@@ -977,7 +977,7 @@ let subst_consts subst_map f =
                   sorted_fv_term_acc sign t1, Match (t1, fs1) :: guards1)
             guards (IdMap.empty, [])
         in
-        TermGenerator (guards1, List.map (subst_consts_term subst_map) gen_terms)
+        TermGenerator (guards1, List.map (subst_consts_term subst_map) gen_terms, ud)
     | Pattern (t, fs) -> Pattern (subst_consts_term subst_map t, List.map subst_filter fs)
     | a -> a
   in
@@ -1036,13 +1036,13 @@ let subst subst_map f =
     in vs1, sm2
   in
   let suba bvs1 sm = function
-    | TermGenerator (guards, gen_terms) -> 
+    | TermGenerator (guards, gen_terms, ud) ->
         let guards1 = 
           List.map 
             (function Match (t, f) -> Match (subst_term sm t, f))
             guards
         in
-        TermGenerator (guards1, List.map (subst_term sm) gen_terms)
+        TermGenerator (guards1, List.map (subst_term sm) gen_terms, ud)
     | Pattern (t, fs) -> Pattern (subst_term sm t, fs)
     | a -> a
   in

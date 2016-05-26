@@ -13,7 +13,7 @@ let open_axioms ?(force=false) open_cond axioms =
     List.fold_right 
       (fun ann (generators, a1) ->
         match ann with
-        | TermGenerator (g, t) ->
+        | TermGenerator (g, t, _) ->
             let gen = (g, t) in
             gen :: generators, a1
         | _ -> generators, ann :: a1
