@@ -130,11 +130,11 @@ let ematch filters t rep_terms egraph subst_maps =
   List.filter (fun sm -> filter_term filters (subst_term sm t) sm) subst_maps1 
 
 let generate_terms generators ground_terms =
-  let rec add_terms new_terms t =
+  let rec add_terms ?(print=false) new_terms t =
     if TermSet.mem t new_terms then new_terms else
     match t with
     | App (sym, ts, _) ->
-        (* Printf.printf "      Added %s\n" (string_of_term t); *)
+        (* if print then Printf.printf "      Added %s\n" (string_of_term t); *)
         List.fold_left add_terms (TermSet.add t new_terms) ts
     | Var _ -> failwith ("InstGen.generate_terms: ground term expected, found "  ^ (string_of_term t))
   in
@@ -167,16 +167,16 @@ let generate_terms generators ground_terms =
   in
   let rec generate round new_terms old_terms = function
     | (guards, gen_terms) :: generators1 ->
-        (*
-        print_endline "======";
-        List.iter (fun t -> print_endline ("  generator: " ^ string_of_term t)) gen_terms;
-        *)
+        if Debug.is_debug 1 then begin
+          print_endline "======";
+          List.iter (fun t -> print_endline ("  generator: " ^ string_of_term t)) gen_terms;
+        end;
         let subst_maps =
           List.fold_left (fun subst_maps -> function Match (t, filters) -> 
-            (*
-            print_endline ("  matching " ^ (string_of_term t));
-            List.iter (fun f -> print_endline ("    subject to " ^ (string_of_filter f))) filters;
-            *)
+            if Debug.is_debug 1 then begin
+              print_endline ("  matching " ^ (string_of_term t));
+              List.iter (fun f -> print_endline ("    subject to " ^ (string_of_filter f))) filters;
+            end;
             let new_subst_maps =
               List.fold_left 
                 (fun new_subst_maps sm ->
@@ -197,7 +197,7 @@ let generate_terms generators ground_terms =
                 (fun acc gen_term ->
                   let t = subst_term sm gen_term in
                   (*let _ = print_endline ("    Generated term " ^ string_of_term t) in*)
-                  add_terms acc t)
+                  add_terms ~print:true acc t)
                 acc gen_terms
             )
             new_terms subst_maps

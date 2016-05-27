@@ -9,41 +9,44 @@ open SimplifyGrass
  
 (** Remove binders for universal quantified variables in [axioms] that satisfy the condition [open_cond]. *)
 let open_axioms ?(force=false) open_cond axioms =
-  let extract_generators generators a =
+  let extract_generators gens ud_gens a =
     List.fold_right 
-      (fun ann (generators, a1) ->
+      (fun ann (gens, ud_gens, a1) ->
         match ann with
-        | TermGenerator (g, t, _) ->
+        | TermGenerator (g, t, ud) ->
             let gen = (g, t) in
-            gen :: generators, a1
-        | _ -> generators, ann :: a1
-      ) a (generators, [])
+            if ud then
+              gens, gen :: ud_gens, a1
+            else
+              gen :: gens, ud_gens, a1
+        | _ -> gens, ud_gens, ann :: a1
+      ) a (gens, ud_gens, [])
   in
-  let rec open_axiom generators = function
+  let rec open_axiom gens ud_gens = function
     | Binder (b, [], f, a) ->
-        let f1, generators1 = open_axiom generators f in
-        let generators2, a1 = extract_generators generators a in
-        Binder (b, [], f1, a1), generators2
+        let f1, gens1, ud_gens1 = open_axiom gens ud_gens f in
+        let gens2, ud_gens2, a1 = extract_generators gens ud_gens a in
+        Binder (b, [], f1, a1), gens2, ud_gens2
     | Binder (b, vs, f, a) -> 
         (* extract term generators *)
-        let generators1, a1 = extract_generators generators a in
+        let gens1, ud_gens1, a1 = extract_generators gens ud_gens a in
         let vs1 = List.filter (~~ (open_cond (annotate f a))) vs in
-        let f1, generators2 = open_axiom generators1 f in
+        let f1, gens2, ud_gens2 = open_axiom gens1 ud_gens1 f in
         if !Config.instantiate || force then
-          Binder (b, vs1, f1, a1), generators2
+          Binder (b, vs1, f1, a1), gens2, ud_gens2
         else 
-          Binder (b, vs, f1, a1), generators2
+          Binder (b, vs, f1, a1), gens2, ud_gens2
     | BoolOp (op, fs) -> 
-        let fs1, generators1 = 
-          List.fold_right open_axioms fs ([], generators)
+        let fs1, gens1, ud_gens1 =
+          List.fold_right open_axioms fs ([], gens, ud_gens)
         in
-        BoolOp (op, fs1), generators1
-    | f -> f, generators
-  and open_axioms f (fs1, generators) =
-    let f1, generators1 = open_axiom generators f in
-    f1 :: fs1, generators1
+        BoolOp (op, fs1), gens1, ud_gens1
+    | f -> f, gens, ud_gens
+  and open_axioms f (fs1, gens, ud_gens) =
+    let f1, gens1, ud_gens1 = open_axiom gens ud_gens f in
+    f1 :: fs1, gens1, ud_gens1
   in
-  List.fold_right open_axioms axioms ([], [])
+  List.fold_right open_axioms axioms ([], [], [])
 
 (** Open condition that checks whether the given sorted variable is a field. *)
 let isFld f = function (_, Map (Loc _, _)) -> true | _ -> false
@@ -55,8 +58,8 @@ let isFunVar f =
 
 (** Compute the set of generated ground terms for formulas [fs] *)
 let generated_ground_terms fs =
-  let _, generators = open_axioms isFunVar fs in
-  let gts = generate_terms generators (ground_terms ~include_atoms:true (mk_and fs)) in
+  let _, gens, ud_gens = open_axioms isFunVar fs in
+  let gts = generate_terms (gens @ ud_gens) (ground_terms ~include_atoms:true (mk_and fs)) in
   gts
   
 (** Eliminate all implicit and explicit existential quantifiers using skolemization.
@@ -318,7 +321,7 @@ let add_read_write_axioms fs =
   let basic_structs = struct_sorts_of_fields basic_pt_flds in
   (* instantiate null axioms *)
   let axioms = SortSet.fold (fun srt axioms -> Axioms.null_axioms srt @ axioms) basic_structs [] in
-  let null_ax, _ = open_axioms ~force:true isFld axioms in
+  let null_ax, _, _ = open_axioms ~force:true isFld axioms in
   let classes = CongruenceClosure.congr_classes fs gts in
   (* CAUTION: not forcing the instantiation here would yield an inconsistency with the read/write axioms *)
   let null_ax1 = instantiate_with_terms ~force:true false null_ax (CongruenceClosure.restrict_classes classes basic_pt_flds) in
@@ -417,10 +420,26 @@ let add_array_axioms fs gts =
   let srts = array_sorts gts in
   let axioms = SortSet.fold (fun srt axioms -> Axioms.array_axioms srt @ axioms) srts [] in
   axioms @ fs
-  
+
+let terms_from_neg_assert fs =
+  let has_label = List.exists (function Label _ -> true | _ -> false) in
+  let rec process_form terms = function
+    | Atom (_, anns) as f ->
+      if has_label anns then
+        ground_terms ~include_atoms:true f |> TermSet.union terms
+      else terms
+    | BoolOp (_, fs) -> process_forms terms fs
+    | Binder (_, _, f1, anns) as f ->
+      if has_label anns then
+        ground_terms ~include_atoms:true f |> TermSet.union terms
+      else process_form terms f1
+  and process_forms terms fs = List.fold_left process_form terms fs
+  in
+  process_forms TermSet.empty fs
+
 let instantiate read_propagators fs gts =
   (* generate local instances of all remaining axioms in which variables occur below function symbols *)
-  let fs1, generators = open_axioms isFunVar fs in
+  let fs1, gens, ud_gens = open_axioms isFunVar fs in
   let _ =
     if Debug.is_debug 1 then
       begin
@@ -428,8 +447,29 @@ let instantiate read_propagators fs gts =
         TermSet.iter (fun t -> print_endline ("  " ^ (string_of_term t))) gts;
       end  
   in
+  (* Sperate the ground terms that come from negated assertion *)
+  let gts_a = terms_from_neg_assert fs1 in
+  (* And add all terms in gts that contain these *)
+  let gts_a =
+    TermSet.elements gts
+    |> List.filter (has_subterm_in gts_a)
+    (* Also add all their subterms *)
+    |> List.map ground_terms_term
+    |> List.fold_left (fun a s -> TermSet.union a s) TermSet.empty
+    |> TermSet.union gts_a
+  in
+  if true then begin
+    print_endline "\nGround terms in assert:";
+    gts_a |>
+      TermSet.iter (fun t -> Printf.printf "  %s\n" (string_of_term t));
+  end;
   let btwn_gen = btwn_field_generators fs in
-  let gts1 = generate_terms (read_propagators @ btwn_gen @ generators) gts in
+  (* Use user defined term gens only on gts from assertion *)
+  let gts1 =
+    TermSet.union
+      (generate_terms (read_propagators @ btwn_gen @ gens) gts)
+      (generate_terms ud_gens gts_a)
+  in
   let _ =
     if Debug.is_debug 1 then
       begin
@@ -471,7 +511,12 @@ let instantiate read_propagators fs gts =
   let fs2, gts2 =
     let fs1 = instantiate_with_terms true others classes in
     let gts_inst = generated_ground_terms (List.rev_append eqs fs1) in
-    let gts2 = generate_terms (read_propagators @ btwn_gen @ generators) gts_inst in
+    (* Use user defined term gens only on gts from assertion *)
+    let gts2 =
+      TermSet.union
+        (generate_terms (read_propagators @ btwn_gen @ gens) gts_inst)
+        (generate_terms ud_gens gts_a)
+    in
     if TermSet.subset gts2 gts_inst
     then fs1, gts1
     else

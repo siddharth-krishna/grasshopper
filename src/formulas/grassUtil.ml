@@ -1327,3 +1327,14 @@ module Clauses = struct
   let to_form cs = smk_and (List.map smk_or cs)
 
 end
+
+(** Check if [t] contains a subterm from set [ts] *)
+let has_subterm_in ts t =
+  let rec st = function
+    | Var (_, _) as t2 -> TermSet.mem t2 ts
+    | App (_, ts1, _) as t2 ->
+      if TermSet.mem t2 ts
+      then true
+      else List.exists st ts1
+  in
+  st t
