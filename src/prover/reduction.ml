@@ -447,9 +447,9 @@ let instantiate read_propagators fs gts =
         TermSet.iter (fun t -> print_endline ("  " ^ (string_of_term t))) gts;
       end  
   in
-  (* Sperate the ground terms that come from negated assertion *)
+  let btwn_gen = btwn_field_generators fs in
+  (* Use user defined term gens only on gts from assertion *)
   let gts_a = terms_from_neg_assert fs1 in
-  (* And add all terms in gts that contain these *)
   let gts_a =
     TermSet.elements gts
     |> List.filter (has_subterm_in gts_a)
@@ -458,13 +458,6 @@ let instantiate read_propagators fs gts =
     |> List.fold_left (fun a s -> TermSet.union a s) TermSet.empty
     |> TermSet.union gts_a
   in
-  if true then begin
-    print_endline "\nGround terms in assert:";
-    gts_a |>
-      TermSet.iter (fun t -> Printf.printf "  %s\n" (string_of_term t));
-  end;
-  let btwn_gen = btwn_field_generators fs in
-  (* Use user defined term gens only on gts from assertion *)
   let gts1 =
     TermSet.union
       (generate_terms (read_propagators @ btwn_gen @ gens) gts)
@@ -512,6 +505,22 @@ let instantiate read_propagators fs gts =
     let fs1 = instantiate_with_terms true others classes in
     let gts_inst = generated_ground_terms (List.rev_append eqs fs1) in
     (* Use user defined term gens only on gts from assertion *)
+    (* Sperate the ground terms that come from negated assertion *)
+    let gts_a = terms_from_neg_assert fs1 in
+    (* And add all terms in gts that contain these *)
+    let gts_a =
+      TermSet.elements gts_inst
+      |> List.filter (has_subterm_in gts_a)
+      (* Also add all their subterms *)
+      |> List.map ground_terms_term
+      |> List.fold_left (fun a s -> TermSet.union a s) TermSet.empty
+      |> TermSet.union gts_a
+    in
+    if true then begin
+      print_endline "\nGround terms in assert:";
+      gts_a |>
+      TermSet.iter (fun t -> Printf.printf "  %s\n" (string_of_term t));
+    end;
     let gts2 =
       TermSet.union
         (generate_terms (read_propagators @ btwn_gen @ gens) gts_inst)
