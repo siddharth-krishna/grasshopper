@@ -73,16 +73,21 @@ let add_ghost_field_invariants prog =
     let pred_term = mk_free_app Bool pred_id [fld; alloc_set] in
     let gen = TermGenerator ([Match (pred_term, [])], [mk_known pred_term]) in
     let body = mk_spec_form (FOL (annotate body_form [gen])) name None (decl.var_pos) in
+    let contract =
+      { contr_name = pred_id;
+        contr_formals = [decl.var_name; alloc_id];
+        contr_returns = []; 
+        contr_locals = IdMap.add decl.var_name decl locals;
+        contr_precond = [];
+        contr_postcond = [];
+        contr_footprint_sorts = SortSet.empty;
+        contr_pos = decl.var_pos;
+      }
+    in
     let pred = 
-      { pred_name = pred_id;
-        pred_formals = [decl.var_name; alloc_id];
-        pred_footprints = [];
-        pred_outputs = []; 
-        pred_locals = IdMap.add decl.var_name decl locals; 
+      { pred_contract = contract;  
         pred_body = body;
-        pred_pos = decl.var_pos;
         pred_accesses = IdSet.empty;
-        pred_is_footprint = false;
       }
     in
     pred :: preds,
@@ -123,9 +128,14 @@ let add_ghost_field_invariants prog =
     in 
     let pre_invs = List.map mk_inv accessed in
     let post_invs = List.map mk_inv modified in
-    { proc with 
-      proc_precond = pre_invs @ proc.proc_precond; 
-      proc_postcond = post_invs @ proc.proc_postcond;
+    let contract =
+      { proc.proc_contract with
+        contr_precond = pre_invs @ precond_of_proc proc; 
+        contr_postcond = post_invs @ postcond_of_proc proc;
+      }
+    in
+    { proc with
+      proc_contract = contract;
     }
   in
   let prog1 = List.fold_left declare_pred prog preds in
@@ -233,7 +243,7 @@ let elim_arrays prog =
   in
   let compile_proc (elem_sorts, procs) proc =
     let all_locals =
-      prog.prog_vars ::  List.map (fun proc -> proc.proc_locals) (find_proc_with_deps prog proc.proc_name)
+      prog.prog_vars ::  List.map (fun proc -> locals_of_proc proc) (find_proc_with_deps prog (name_of_proc proc))
     in
     let locals, elem_sorts =
       let rec process_sort locals elem_sorts = function
@@ -255,20 +265,25 @@ let elim_arrays prog =
           IdMap.fold
             (fun id decl (locals, elem_sorts) -> process_sort locals elem_sorts decl.var_sort)
             vars (locals, elem_sorts))
-        (proc.proc_locals, elem_sorts) all_locals
+        (locals_of_proc proc, elem_sorts) all_locals
     in
     let body1 = Util.Opt.map compile_cmd proc.proc_body in
-    let precond1 = List.map compile_spec proc.proc_precond in
-    let postcond1 = List.map compile_spec proc.proc_postcond in
+    let precond1 = List.map compile_spec (precond_of_proc proc) in
+    let postcond1 = List.map compile_spec (postcond_of_proc proc) in
+    let contract1 =
+      { proc.proc_contract with
+        contr_locals = locals;
+        contr_precond = precond1;
+        contr_postcond = postcond1;
+     }
+    in
     let proc1 =
       { proc with
-        proc_locals = locals;
+        proc_contract = contract1;
         proc_body = body1;
-        proc_precond = precond1;
-        proc_postcond = postcond1;
       }
     in
-    elem_sorts, IdMap.add proc.proc_name proc1 procs
+    elem_sorts, IdMap.add (name_of_proc proc) proc1 procs
   in
   let compile_pred (elem_sorts, preds) pred =
     let elem_sorts =
@@ -278,11 +293,24 @@ let elim_arrays prog =
           | Loc (Array srt)
           | Loc (ArrayCell srt) -> SortSet.add srt elem_sorts
           | _ -> elem_sorts)
-        pred.pred_locals elem_sorts
+        (locals_of_pred pred) elem_sorts
     in
     let body = compile_spec pred.pred_body in
-    let pred1 = { pred with pred_body = body } in
-    elem_sorts, IdMap.add pred.pred_name pred1 preds
+    let precond1 = List.map compile_spec (precond_of_pred pred) in
+    let postcond1 = List.map compile_spec (postcond_of_pred pred) in
+    let contract1 =
+      { pred.pred_contract with
+        contr_precond = precond1;
+        contr_postcond = postcond1;
+     }
+    in
+    let pred1 =
+      { pred with
+        pred_contract = contract1;
+        pred_body = body          
+      }
+    in
+    elem_sorts, IdMap.add (name_of_pred pred) pred1 preds
   in
   let elem_sorts, procs = fold_procs compile_proc (SortSet.empty, IdMap.empty) prog in
   let elem_sorts, preds = fold_preds compile_pred (elem_sorts, IdMap.empty) prog in
@@ -299,6 +327,7 @@ let elim_arrays prog =
   }
 
 (** Add frame axioms for framed predicates and functions *)
+(*
 let annotate_frame_axioms prog =
   let process_pred frame_axioms pred =
     let footprints =
@@ -412,153 +441,203 @@ let annotate_frame_axioms prog =
     Prog.fold_preds process_pred [] prog
   in
   { prog with prog_axioms = frame_axioms @ prog.prog_axioms }
-
+*)
   
 (** Desugare SL specification to FOL specifications. 
  ** Assumes that loops have been transformed to tail-recursive procedures. *)
 let elim_sl prog =
-  let pred_to_form p args domains = 
-    let decl = find_pred prog p in
-    let _, fps, _ =
-      Util.map2_remainder (fun _ _ -> ()) args decl.pred_formals
+  (*let footprint_ids fps =
+    SortSet.fold (fun srt acc -> footprint_id (Set srt) :: acc) fps []
+  in*)
+  let prepare_sl_form sfs name =
+    let fs, aux, kind_opt = 
+      List.fold_right (fun sf (fs, aux, kind) -> 
+        let new_kind = 
+          match kind with
+          | Some Checked -> Some Checked
+          | _ -> Some (sf.spec_kind)
+        in
+        match sf.spec_form, aux with
+        | SL f, None -> 
+            f :: fs, 
+            Some (sf.spec_name, sf.spec_msg, sf.spec_pos),
+            new_kind
+        | SL f, Some (_, _, p) -> 
+            f :: fs, 
+            Some (sf.spec_name, sf.spec_msg, merge_src_pos p sf.spec_pos),
+            new_kind
+        | _ -> fs, aux, kind)
+        sfs ([], None, None)
     in
+    let name, msg, pos = Util.Opt.get_or_else (name, None, dummy_position) aux in
+    let kind = Util.Opt.get_or_else Checked kind_opt in
+    SlUtil.mk_sep_star_lst ~pos:pos fs, kind, name, msg, pos
+  in
+  let is_pure pred = match pred.pred_body.spec_form with
+  | FOL _ | SL (Sl.Pure _) -> true
+  | _ -> false
+  in
+  let pred_to_form fp_context p args domains = 
+    let decl = find_pred prog p in
     let mk_empty_except ssrts =
       SortMap.fold
         (fun ssrt dom eqs ->
-          if List.mem ssrt ssrts then eqs
+          if SortSet.mem ssrt ssrts then eqs
           else mk_eq dom (mk_empty (Set (Loc ssrt))) :: eqs)
         domains []
     in
-    match fps with
-    | [] ->
-        let fp_args, ssrts =
-          Util.map_split (fun id ->
-            let fp_decl = IdMap.find id decl.pred_locals in
-            let ssrt = struct_sort_of_sort (element_sort_of_sort fp_decl.var_sort) in
-            (try SortMap.find ssrt domains
-            with Not_found ->
-              failwith ("Could not find footprint set for sort " ^ string_of_sort ssrt ^ " in predicate " ^ string_of_ident p)),
-            ssrt)
-            decl.pred_footprints
-        in
-        let eqs = mk_empty_except ssrts in
-        smk_and (mk_pred p (args @ fp_args) :: eqs)
-    | _ ->
-        let fp_eqs, ssrts =
-          Util.map_split
-            (fun fp ->
-              let ssrt = struct_sort_of_sort (element_sort_of_set fp) in
-              mk_eq fp (SortMap.find ssrt domains), ssrt)
-            fps
-        in
-        let eqs = mk_empty_except ssrts in
-        smk_and (mk_pred p args :: fp_eqs @ eqs)
-  in
-  (* transform the preds from SL to GRASS *)
-  (*let preds =
-    if !Config.predefPreds
-    then fold_preds compile_pred_acc IdMap.empty prog
-    else compile_preds (preds prog)
-  in
-  let prog = { prog with prog_preds = preds; } in *)
-  let struct_srts = struct_sorts prog in
-  (* declare alloc sets *)
-  let prog =
-    let globals_with_alloc_sets =
-      SortSet.fold
-        (fun ssrt acc -> IdMap.add (alloc_id ssrt) (alloc_decl ssrt) acc)
-        struct_srts
-        prog.prog_vars
+    let footprint_sorts = footprint_sorts_pred decl in
+    let fp_caller_args, fp_args =
+      SortSet.fold (fun ssrt (fp_caller_args, fp_args) ->
+        try
+          SortMap.find ssrt fp_context :: fp_caller_args,
+          SortMap.find ssrt domains :: fp_args
+        with Not_found ->
+          failwith ("Could not find footprint set for sort " ^ string_of_sort ssrt ^ " in predicate " ^ string_of_ident p))
+        footprint_sorts ([], [])
     in
-    { prog with prog_vars = globals_with_alloc_sets }
+    let fp_args, p_footprints =
+      if is_pure decl
+      then [], SortSet.empty
+      else fp_args, footprint_sorts
+    in
+    let eqs = mk_empty_except p_footprints in
+    smk_and (mk_pred p (args @ fp_caller_args @ fp_args) :: eqs)
   in
-  let compile_proc proc =
-    (* add auxiliary set variables *)
-    let new_locals, aux_formals, aux_returns = 
-      SortSet.fold (fun ssrt (new_locals, aux_formals, aux_returns) ->
-        let footprint_id = footprint_id ssrt in
-        let footprint_caller_id = footprint_caller_id ssrt in
-        let final_footprint_caller_id = final_footprint_caller_id ssrt in
-        let footprint_decl = mk_loc_set_decl ssrt footprint_id proc.proc_pos in
-        (footprint_id, { footprint_decl with var_is_implicit = true }) ::
-        List.map (fun id -> (id, mk_loc_set_decl ssrt id proc.proc_pos)) 
-          [footprint_caller_id; final_footprint_caller_id] @
-        new_locals,
-        footprint_caller_id :: footprint_id :: aux_formals,
-        final_footprint_caller_id :: aux_returns)
-        struct_srts ([], [], [])    
-    in
-    let locals =
-      List.fold_left 
-        (fun locals (id, decl) -> IdMap.add id decl locals)
-        proc.proc_locals 
-        new_locals
-    in
-    let returns = proc.proc_returns @ aux_returns in
-    let formals = proc.proc_formals @ aux_formals in
-    let convert_sl_form sfs name =
-      let fs, aux, kind_opt = 
-        List.fold_right (fun sf (fs, aux, kind) -> 
-          let new_kind = 
-            match kind with
-            | Some Checked -> Some Checked
-            | _ -> Some (sf.spec_kind)
-          in
-          match sf.spec_form, aux with
-          | SL f, None -> 
-              f :: fs, 
-              Some (sf.spec_name, sf.spec_msg, sf.spec_pos),
-              new_kind
-          | SL f, Some (_, _, p) -> 
-              f :: fs, 
-              Some (sf.spec_name, sf.spec_msg, merge_src_pos p sf.spec_pos),
-              new_kind
-          | _ -> fs, aux, kind)
-          sfs ([], None, None)
+  (* post process SL formula *)
+  let post_process_form f =
+    let subst_preds f =
+      let s sym ts srt =
+        match sym with
+        | FreeSym p when IdMap.mem p prog.prog_preds ->
+            let decl = find_pred prog p in
+            if List.length (formals_of_pred decl) <> List.length ts
+            then mk_app srt sym ts else
+            let fps =
+              SortSet.fold
+                (fun ssrt fps -> footprint_caller_set ssrt :: fps)
+                (footprint_sorts_pred decl) []
+            in
+            mk_app srt sym (ts @ fps) 
+        | _ -> mk_app srt sym ts 
       in
-      let name, msg, pos = Util.Opt.get_or_else (name, None, dummy_position) aux in
-      let kind = Util.Opt.get_or_else Checked kind_opt in
-      SlUtil.mk_sep_star_lst ~pos:pos fs, kind, name, msg, pos
+      subst_funs s f
     in
-    let footprint_ids, footprint_sets =
+    let simplify f =
+      let round f =
+        f |>
+        propagate_exists_up |>
+        mk_not |>
+        nnf |>
+        foralls_to_exists |>
+        SimplifyGrass.simplify_one_sets |>
+        mk_not |>
+        nnf |>
+        foralls_to_exists 
+      in
+      f |> round |> round |> propagate_exists_up
+    in
+    f |>
+    subst_preds |>
+    simplify
+  in
+  let translate_contract contr is_proc is_tailrec is_pure modifies =
+    let pos = contr.contr_pos in
+    let footprint_sorts = contr.contr_footprint_sorts in
+    (* add auxiliary set variables *)
+    let locals, footprint_formals, footprint_caller_formals, footprint_caller_returns =
       SortSet.fold
-        (fun ssrt (ids, sets) ->
-          footprint_id ssrt :: ids,
-          SortMap.add ssrt (footprint_set ssrt) sets)
-        struct_srts ([], SortMap.empty)
+        (fun ssrt (locals, footprint_formals, footprint_caller_formals, footprint_caller_returns) ->          
+          let locals1, footprint_formals1 =
+            if not is_proc && is_pure then locals, footprint_formals
+            else 
+              let footprint_id = footprint_id ssrt in
+              let footprint_decl = mk_loc_set_decl ssrt footprint_id pos in
+              IdMap.add footprint_id { footprint_decl with var_is_implicit = true } locals,
+              footprint_id :: footprint_formals
+          in
+          let locals1, footprint_caller_returns1 =
+            if not is_proc then locals1, footprint_caller_returns
+            else
+              let final_footprint_caller_id = final_footprint_caller_id ssrt in
+              let final_footprint_caller_decl = mk_loc_set_decl ssrt final_footprint_caller_id pos in
+              IdMap.add final_footprint_caller_id final_footprint_caller_decl locals1,
+              final_footprint_caller_id :: footprint_caller_returns
+          in
+          let footprint_caller_id = footprint_caller_id ssrt in
+          let footprint_caller_decl = mk_loc_set_decl ssrt footprint_caller_id pos in
+          IdMap.add footprint_caller_id footprint_caller_decl locals1,
+          footprint_formals1,
+          footprint_caller_id :: footprint_caller_formals,
+          footprint_caller_returns1
+        )
+        footprint_sorts (contr.contr_locals, [], [], [])    
+    in
+    let aux_formals = footprint_caller_formals @ footprint_formals in
+    let returns = contr.contr_returns @ footprint_caller_returns in
+    let formals = contr.contr_formals @ aux_formals in
+    let footprint_ids, footprint_sets, footprint_context =
+      SortSet.fold
+        (fun ssrt (ids, sets, context) ->
+          (if is_pure then ids else footprint_id ssrt :: ids),
+          SortMap.add ssrt (footprint_set ssrt) sets,
+          SortMap.add ssrt (footprint_caller_set ssrt) context
+        )
+        footprint_sorts ([], SortMap.empty, SortMap.empty)
+    in
+    let rec split_sep pure_fs = function
+      | Sl.SepOp ((Sl.SepStar | Sl.SepPlus | Sl.SepIncl), Sl.Pure (f, _), slf, _)
+      | Sl.SepOp ((Sl.SepStar | Sl.SepPlus), slf, Sl.Pure (f, _), _) ->
+          split_sep (f :: pure_fs) slf
+      | Sl.SepOp ((Sl.SepStar | Sl.SepPlus) as op, f1, f2, pos) ->
+          let pure_fs, f1 = split_sep (pure_fs) f1 in
+          let pure_fs, f2 = split_sep (pure_fs) f2 in
+          let mk_op = match op with
+          | Sl.SepStar -> SlUtil.mk_sep_star
+          | Sl.SepPlus -> SlUtil.mk_sep_plus
+          | _ -> failwith "impossible"
+          in
+          pure_fs, mk_op f1 f2
+      | Sl.Pure (f, pos) ->
+          f :: pure_fs, Sl.Atom (Sl.Emp, [], pos)
+      | f -> pure_fs, f
     in
     (* translate SL precondition *)
-    let sl_precond, other_precond = List.partition is_sl_spec proc.proc_precond in
+    let sl_precond, other_precond = List.partition is_sl_spec contr.contr_precond in
     let precond =
-      let name = "precondition of " ^ string_of_ident proc.proc_name in
-      let f, _, name, msg, pos = convert_sl_form sl_precond name in
+      let name = "precondition of " ^ string_of_ident contr.contr_name in
+      let f, _, name, msg, pos = prepare_sl_form sl_precond name in
       let error_msg srt =
         ProgError.mk_error_info "Memory footprint for type " ^ (string_of_sort srt) ^ " does not match this specification"
-      in  
+      in
       let f_eq_init_footprint =
         let fp_inclusions =
           SortSet.fold
             (fun ssrt fs ->
               mk_error_msg (pos, error_msg ssrt)
                 (mk_srcpos pos (mk_subseteq (footprint_set ssrt) (footprint_caller_set ssrt))) :: fs)
-            struct_srts
+            footprint_sorts
             []
         in
-        propagate_exists (mk_and (SlToGrass.to_grass pred_to_form footprint_sets f ::
-                                  fp_inclusions))
+        let sl_pure, sl_nonpure = split_sep [] f in
+        sl_nonpure |>
+        SlToGrass.to_grass (pred_to_form footprint_context) footprint_sets |>
+        post_process_form |>
+        (fun f -> mk_and (f :: sl_pure @ fp_inclusions))
+        (*|> (fun f -> print_endline (string_of_ident contr.contr_name ^ " (after):"); print_form stdout f; print_newline (); f)*)
       in
       let precond = mk_spec_form (FOL f_eq_init_footprint) name msg pos in
-      let fp_name = "initial footprint of " ^ string_of_ident proc.proc_name in
+      let fp_name = "initial footprint of " ^ string_of_ident contr.contr_name in
       let null_not_in_alloc =
         SortSet.fold
           (fun ssrt fs -> mk_not (mk_elem (mk_null ssrt) (alloc_set ssrt)) :: fs)
-          struct_srts
+          footprint_sorts
           []
       in
       let footprint_caller_in_alloc =
         SortSet.fold
           (fun ssrt fs -> mk_subseteq (footprint_caller_set ssrt) (alloc_set ssrt) :: fs)
-          struct_srts
+          footprint_sorts
           []
       in
       let free_preconds =
@@ -567,10 +646,10 @@ let elim_sl prog =
       in
       (* additional precondition for tail-recursive procedures *)
       let tailrec_precond =
-        if not proc.proc_is_tailrec then [] else
+        if not is_tailrec then [] else
         let first_iter_id = List.hd formals in
         let msg caller =
-          if caller <> proc.proc_name then
+          if caller <> contr.contr_name then
             "An invariant might not hold before entering this loop",
             ProgError.mk_error_info "This is the loop invariant that might not hold initially"
           else 
@@ -581,52 +660,67 @@ let elim_sl prog =
           let f = mk_or [mk_pred first_iter_id []; 
                          mk_error_msg (pos, error_msg ssrt)
                            (mk_srcpos pos
-                              (mk_eq 
+                              (mk_subseteq
                                  (footprint_set ssrt)
-                                 (mk_union [footprint_set ssrt; footprint_caller_set ssrt])))]
+                                 (footprint_caller_set ssrt)))]
           in
           mk_spec_form (FOL f) "invariant" (Some msg) pos :: fs)
-          struct_srts
+          footprint_sorts
           []
       in
       precond :: free_preconds @ tailrec_precond
     in
+    let other_precond = List.map (map_spec_fol_form post_process_form) other_precond in
     (* translate SL postcondition *)
     let init_alloc_set ssrt = oldify_term (IdSet.singleton (alloc_id ssrt)) (alloc_set ssrt) in
     let init_footprint_caller_set ssrt = footprint_caller_set ssrt in
     let init_footprint_set ssrt = footprint_set ssrt in
     let final_footprint_set ssrt =
-      mk_union [mk_inter [alloc_set ssrt; init_footprint_set ssrt];
-                mk_diff (alloc_set ssrt) (init_alloc_set ssrt)]
+      if is_proc then
+        mk_union [mk_inter [alloc_set ssrt; init_footprint_set ssrt];
+                  mk_diff (alloc_set ssrt) (init_alloc_set ssrt)]
+      else init_footprint_set ssrt
     in
-    let final_alloc_set ssrt =
-      mk_union [mk_diff (init_alloc_set ssrt) (init_footprint_caller_set ssrt);
-                (final_footprint_caller_set ssrt)]
-    in
-    let sl_postcond, other_postcond = List.partition is_sl_spec proc.proc_postcond in
+    let sl_postcond, other_postcond = List.partition is_sl_spec contr.contr_postcond in
     let postcond, post_pos =
-      let name = "postcondition of " ^ string_of_ident proc.proc_name in
-      let f, kind, name, msg, pos = convert_sl_form sl_postcond name in
-      (*Printf.printf "%s: %d\n" (string_of_ident proc.proc_name) (List.length fs);*)
-      let final_footprint_sets =
-        SortSet.fold (fun ssrt sets -> SortMap.add ssrt (final_footprint_set ssrt) sets) struct_srts SortMap.empty
-      in
-      let f_eq_final_footprint = 
-        SlToGrass.to_grass pred_to_form final_footprint_sets f 
-      in
-      let final_footprint_postcond =
-        mk_spec_form (FOL f_eq_final_footprint) name msg pos
-      in
-      (*let init_footprint_postcond = 
-        mk_free_spec_form (FOL (mk_eq init_footprint_set (oldify_term (IdSet.singleton footprint_id) footprint_set))) name msg pos
-      in*)
-      [{ final_footprint_postcond with 
-        spec_kind = kind;
-       }], pos
+      match sl_postcond with
+      | [] -> [], pos
+      | _ ->
+          let name = "postcondition of " ^ string_of_ident contr.contr_name in
+          let f, kind, name, msg, pos = prepare_sl_form sl_postcond name in
+          (*Printf.printf "%s: %d\n" (string_of_ident proc.proc_name) (List.length fs);*)
+          let final_footprint_sets =
+            SortSet.fold
+              (fun ssrt sets -> SortMap.add ssrt (final_footprint_set ssrt) sets)
+              footprint_sorts SortMap.empty
+          in
+          let sl_pure, sl_nonpure = split_sep [] f in
+          let f_eq_final_footprint =
+            sl_nonpure |>
+            SlToGrass.to_grass (pred_to_form final_footprint_sets) final_footprint_sets |>
+            post_process_form |>
+            (fun f -> mk_and (f :: sl_pure)) |>
+            elim_old_form modifies
+          in
+          let final_footprint_postcond =
+            mk_spec_form (FOL f_eq_final_footprint) name msg pos
+          in
+          (*let init_footprint_postcond = 
+            mk_free_spec_form (FOL (mk_eq init_footprint_set (oldify_term (IdSet.singleton footprint_id) footprint_set))) name msg pos
+            in*)
+          [{ final_footprint_postcond with 
+             spec_kind = kind;
+           }], pos
+    in
+    let other_postcond =
+      List.map
+        (map_spec_fol_form (fun f -> f |> post_process_form |> elim_old_form modifies))
+        other_postcond
     in
     (* generate frame condition by applying the frame rule *) 
-    let framecond = 
-      let name = "framecondition of " ^ (string_of_ident proc.proc_name) in
+    let framecond =
+      if not is_proc then [] else
+      let name = "framecondition of " ^ (string_of_ident contr.contr_name) in
       let mk_framecond f = mk_free_spec_form (FOL f) name None post_pos in
       (* final caller footprint is frame with final footprint *)
       let final_footprint_caller_postconds = 
@@ -637,14 +731,18 @@ let elim_sl prog =
                          (final_footprint_set ssrt)])
           in
           mk_framecond f :: fs)
-          struct_srts []
+          footprint_sorts []
       in
       (* null is not allocated *)
+      let final_alloc_set ssrt =
+        mk_union [mk_diff (init_alloc_set ssrt) (init_footprint_caller_set ssrt);
+                  (final_footprint_caller_set ssrt)]
+      in
       let final_null_alloc =
         SortSet.fold (fun ssrt fs ->
           mk_framecond (mk_and [mk_eq (alloc_set ssrt) (final_alloc_set ssrt); 
                                 mk_not (smk_elem (mk_null ssrt) (alloc_set ssrt))]) :: fs)
-          struct_srts []
+          footprint_sorts []
       in
       (* frame axioms for modified fields *)
       let all_fields =
@@ -660,7 +758,7 @@ let elim_sl prog =
       let frame_preds =
         IdMap.fold
           (fun fld srt frames ->
-            if !Config.opt_field_mod && not (IdSet.mem fld (modifies_proc prog proc))
+            if !Config.opt_field_mod && not (IdSet.mem fld modifies)
             then frames else
             let old_fld = oldify fld in
             let ssrt = struct_sort_of_sort (dom_sort srt) in
@@ -674,36 +772,166 @@ let elim_sl prog =
       in
       final_footprint_caller_postconds @ final_null_alloc @ frame_preds
     in
+    let contr1 =
+      { contr with
+        contr_formals = formals;
+        contr_returns = returns;
+        contr_locals = locals;
+        contr_precond = precond @ other_precond;
+        contr_postcond = postcond @ framecond @ other_postcond;
+      }
+    in
+    contr1, footprint_sets, footprint_context
+  in
+  (* translate the predicates from SL to GRASS *)
+  let translate_pred (preds, axioms) pred =
+    let is_pure = is_pure pred in
+    let pos = pos_of_pred pred in
+    let pname = name_of_pred pred in
+    (* print_endline @@ "translating predicate " ^ string_of_ident pname; *)
+    let contract, footprint_sets, footprint_context =
+      translate_contract pred.pred_contract false false is_pure IdSet.empty
+    in
+    let formals = contract.contr_formals in
+    let locals = contract.contr_locals in
+    let translate_sl_body body =
+      body |>
+      (function
+        | Sl.Pure (f, _) -> f
+        | f -> SlToGrass.to_grass (pred_to_form footprint_context) footprint_sets f) |>
+      (* (fun f -> print_form stdout f; print_newline (); f) |> *)
+      post_process_form |>
+      fun f -> FOL f
+    in
+    let frame_axioms =
+      let res_srt = Prog.result_sort_of_pred pred in
+      let mk_old_arg id =
+        let decl = IdMap.find id locals in
+        mk_var decl.var_sort id
+      in
+      let old_pred =
+        mk_free_app res_srt pname (List.map mk_old_arg formals)
+      in
+      let new_arg_ids =
+        List.fold_left (fun new_args id1 ->
+          try
+            let decl = IdMap.find id1 pred.pred_contract.contr_locals in
+            IdMap.add id1 (id1, decl.var_sort) new_args
+          with Not_found ->
+            let decl = IdMap.find id1 locals in
+            let id2 = fresh_ident (name id1) in 
+            IdMap.add id1 (id2, decl.var_sort) new_args)
+          IdMap.empty formals
+      in
+      let mk_new_arg id1 = 
+        let id2, srt = IdMap.find id1 new_arg_ids in
+        mk_var srt id2
+      in
+      let new_pred =
+        mk_free_app res_srt pname (List.map mk_new_arg formals)
+      in
+      (*let guards =
+        List.map
+          (fun id -> mk_eq (mk_old_arg id) (mk_new_arg id))
+          formals 
+      in*)
+      let name = "frame of " ^ string_of_ident pname in
+      let annot =
+        match pred.pred_contract.contr_returns with
+        | [] -> [Pattern (mk_known (old_pred), []); Pattern (mk_known (new_pred), [])]
+        | _ -> []
+      in
+      let axiom_forms =
+        [Axioms.mk_axiom name (mk_eq old_pred new_pred) |> fun f -> annotate f annot]
+      in
+      List.map (fun axiom -> mk_free_spec_form (FOL axiom) name None pos) axiom_forms
+    in
+    let translate_body sf =
+      let f1 = match sf.spec_form with
+      | SL f -> translate_sl_body f
+      | FOL f -> FOL (post_process_form f)
+      in { sf with spec_form = f1 }
+    in
+    let pred1 =
+      { pred with
+        pred_contract = contract;
+        pred_body = translate_body pred.pred_body
+      }
+    in
+    IdMap.add pname pred1 preds, frame_axioms @ axioms
+  in
+  let axioms = List.map (map_spec_fol_form post_process_form) prog.prog_axioms in
+  let preds, axioms = fold_preds translate_pred (IdMap.empty, axioms) prog in
+  let prog = { prog with prog_preds = preds; prog_axioms = axioms } in
+  let struct_srts = struct_sorts prog in
+  (* declare alloc sets *)
+  let prog =
+    let globals_with_alloc_sets =
+      SortSet.fold
+        (fun ssrt acc -> IdMap.add (alloc_id ssrt) (alloc_decl ssrt) acc)
+        struct_srts
+        prog.prog_vars
+    in
+    { prog with prog_vars = globals_with_alloc_sets }
+  in
+  let compile_proc proc =
+    let proc_footprints = footprint_sorts_proc proc in
+    let contract, footprint_sets, footprint_pre_context =
+      translate_contract proc.proc_contract true proc.proc_is_tailrec false (modifies_proc prog proc)
+    in
     (* update all procedure calls and return commands in body *)
     let rec compile_stmt = function
       | (Call cc, pp) ->
+          let decl = find_proc prog cc.call_name in
+          let footprint_ids, footprint_sets =
+            SortSet.fold
+              (fun ssrt (ids, sets) ->
+                footprint_id ssrt :: ids,
+                footprint_set ssrt :: sets
+              )
+              (footprint_sorts_proc decl) ([], [])
+          in   
           mk_call_cmd ~prog:(Some prog) 
             (cc.call_lhs @ footprint_ids) 
             cc.call_name 
-            (cc.call_args @ SortMap.fold (fun _ s sets -> s :: sets) footprint_sets []) 
+            (cc.call_args @ footprint_sets) 
             pp.pp_pos
       | (Return rc, pp) ->
           let fp_returns =
             SortSet.fold (fun ssrt fp_returns ->
               mk_union [footprint_caller_set ssrt; footprint_set ssrt] :: fp_returns)
-              struct_srts []
+              proc_footprints []
           in
           let rc1 = { return_args = rc.return_args @ fp_returns } in
           Basic (Return rc1, pp)
       | (Assume sf, pp) ->
           (match sf.spec_form with
           | SL f ->
-              let f1 = SlToGrass.to_grass pred_to_form footprint_sets f in
+              let f1 =
+                f |>
+                SlToGrass.to_grass (pred_to_form footprint_sets) footprint_sets |>
+                post_process_form
+              in
               let sf1 = mk_spec_form (FOL f1) sf.spec_name sf.spec_msg sf.spec_pos in
               mk_assume_cmd sf1 pp.pp_pos
-          | FOL f -> Basic (Assume sf, pp))
+          | FOL f ->
+	     let f1 = post_process_form f in
+	     let sf1 = mk_spec_form (FOL f1) sf.spec_name sf.spec_msg sf.spec_pos in
+             mk_assume_cmd sf1 pp.pp_pos)
       | (Assert sf, pp) ->
           (match sf.spec_form with
           | SL f ->
-              let f1 = SlToGrass.to_grass pred_to_form footprint_sets f in
+              let f1 =
+                f |>
+                SlToGrass.to_grass (pred_to_form footprint_sets) footprint_sets |>
+                post_process_form
+              in
               let sf1 = mk_spec_form (FOL f1) sf.spec_name sf.spec_msg sf.spec_pos in
               mk_assert_cmd sf1 pp.pp_pos
-          | FOL f -> Basic (Assert sf, pp))
+          | FOL f ->
+	     let f1 = post_process_form f in
+	     let sf1 = mk_spec_form (FOL f1) sf.spec_name sf.spec_msg sf.spec_pos in
+             mk_assert_cmd sf1 pp.pp_pos)
       | (c, pp) -> Basic (c, pp)
     in
     let body = 
@@ -721,7 +949,7 @@ let elim_sl prog =
                   [footprint_caller_id ssrt] 
                   [new_footprint_caller_set ssrt] 
                   body_pp.pp_pos :: cmds)
-              struct_srts []
+              proc_footprints []
           in
           let assign_final_footprints_caller =
             SortSet.fold
@@ -730,7 +958,7 @@ let elim_sl prog =
                   [final_footprint_caller_id ssrt] 
                   [mk_union [footprint_caller_set ssrt; footprint_set ssrt]]
                   body_pp.pp_pos :: cmds)
-              struct_srts []
+              proc_footprints []
           in
           mk_seq_cmd 
             (assign_init_footprints_caller @ [body1] @ assign_final_footprints_caller)
@@ -741,11 +969,7 @@ let elim_sl prog =
       oldify_spec (modifies_proc prog proc) footprint
     in*)
     { proc with
-      proc_formals = formals;
-      proc_returns = returns;
-      proc_locals = locals;
-      proc_precond = precond @ other_precond;
-      proc_postcond = postcond @ framecond @ other_postcond;
+      proc_contract = contract;
       proc_body = body;
     } 
   in
@@ -753,36 +977,49 @@ let elim_sl prog =
 
 (** Annotate safety checks for heap accesses *)
 let annotate_heap_checks prog =
-  let rec derefs acc = function
+  let rec checks acc = function
     | App (Read, [map; idx], _) ->
         let acc1 =
           match sort_of map with
           | Map (Loc _, _) -> TermSet.add idx acc
           | _ -> acc
         in
-        derefs (derefs acc1 map) idx
+        checks (checks acc1 map) idx
     | App (Length, [map], _) -> TermSet.add map acc
     | App (ArrayCells, [map], _) -> TermSet.add map acc
     | App (Write, fld :: loc :: ts, _) ->
-        List.fold_left derefs (TermSet.add loc acc) (fld :: loc :: ts)
+        List.fold_left checks (TermSet.add loc acc) (fld :: loc :: ts)
+    | App ((Div | Mod), [t1; t2], _) ->
+        List.fold_left checks (TermSet.add t2 acc) [t1; t2]
     | App (_, ts, _) -> 
-        List.fold_left derefs acc ts
+        List.fold_left checks acc ts
     | _ -> acc
   in
   let mk_term_checks pos acc t =
-    let locs = derefs TermSet.empty t in
+    let to_check = checks TermSet.empty t in
     TermSet.fold 
       (fun t acc ->
-        let ssrt = struct_sort_of_sort (sort_of t) in
-        let t_in_footprint = FOL (mk_elem t (footprint_set ssrt)) in
-        let mk_msg callee =
-          let msg = "Possible invalid heap access to location of type " ^ (string_of_sort ssrt) in
-          msg, msg
-        in
-        let sf = mk_spec_form t_in_footprint "check heap access" (Some mk_msg) pos in
-        let check_access = mk_assert_cmd sf pos in
+        match sort_of t with
+        | Int ->
+            let t_not_zero = FOL (mk_not (mk_eq t (mk_int 0))) in
+            let mk_msg callee =
+              let msg = "Possible division by zero" in
+              msg, msg
+            in
+            let sf = mk_spec_form t_not_zero "check division" (Some mk_msg) pos in
+            let check_division = mk_assert_cmd sf pos in
+            check_division :: acc
+        | _ ->
+            let ssrt = struct_sort_of_sort (sort_of t) in
+            let t_in_footprint = FOL (mk_elem t (footprint_set ssrt)) in
+            let mk_msg callee =
+              let msg = "Possible invalid heap access to location of type " ^ (string_of_sort ssrt) in
+              msg, msg
+            in
+            let sf = mk_spec_form t_in_footprint "check heap access" (Some mk_msg) pos in
+            let check_access = mk_assert_cmd sf pos in
         check_access :: acc)
-      locs acc
+      to_check acc
   in
   let ann_term_checks ts cmd =
     let checks = List.fold_left (mk_term_checks (source_pos cmd)) [] ts in

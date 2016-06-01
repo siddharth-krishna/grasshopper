@@ -3,7 +3,8 @@
 struct Node {
   var next: Node;
 }
-
-predicate lseg(x: Node, y: Node)(FP: Set<Node>) {
-  Reach(next, x, y) && FP == { z: Node :: Btwn(next, x, z, y) && z != y }
+ 
+predicate lseg(x: Node, y: Node) {
+  acc({ z: Node :: Btwn(next, x, z, y) && z != y }) &*& Reach(next, x, y)
 }
+

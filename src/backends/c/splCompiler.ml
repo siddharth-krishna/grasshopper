@@ -52,17 +52,21 @@ let convert oc cu =
   in
   (** Forward declarations for structs in order to allow mutual recursion. *)
   let pr_c_struct_fwd_decls ppf cu =
-    let sds = cu.struct_decls in
-    let string_of_struct_fwd_decl s_id = 
-      "struct " ^ (string_of_ident s_id) ^ ";"
+    let tds = cu.type_decls in
+    let string_of_type_fwd_decl t_def t_id = 
+      match t_def with
+      | StructTypeDef _ -> "struct " ^ (string_of_ident t_id) ^ ";"
+      | _ ->
+          (* TODO: better error handling *)
+          failwith "Cannot compile programs with undefined types"
     in
     fprintf ppf "%s"
       (String.concat 
         "\n" 
         (List.rev 
           (IdMap.fold 
-            (fun k {s_name=s_id} a -> (string_of_struct_fwd_decl s_id) :: a) 
-            sds 
+            (fun k {t_name=t_id; t_def=t_def} a -> (string_of_type_fwd_decl t_def t_id) :: a) 
+             tds 
             [])))
   in
   (** Translation of SPL struct declarations into C struct declarations. *)
@@ -77,18 +81,21 @@ let convert oc cu =
       | f :: [] -> pr_c_field ppf f
       | f :: fs -> fprintf ppf "%a@\n%a" pr_c_field f pr_c_fields fs         
     in
-    let pr_c_struct ppf s = 
-      fprintf ppf "typedef struct %s {@\n  @[%a@]@\n} %s;" 
-        (string_of_ident s.s_name) 
-        pr_c_fields (idmap_to_list s.s_fields)
-        (string_of_ident s.s_name)  
+    let pr_c_struct ppf s =
+      match s.t_def with
+      | StructTypeDef fields ->
+          fprintf ppf "typedef struct %s {@\n  @[%a@]@\n} %s;" 
+            (string_of_ident s.t_name) 
+            pr_c_fields (idmap_to_list fields)
+            (string_of_ident s.t_name)
+      | _ -> ()
     in
     let rec pr_c_structs ppf = function 
       | []      -> ()
       | s :: [] -> pr_c_struct ppf s
       | s :: ss -> fprintf ppf "%a@\n@\n%a" pr_c_struct s pr_c_structs ss
     in
-    pr_c_structs ppf (idmap_to_list cu.struct_decls)
+    pr_c_structs ppf (idmap_to_list cu.type_decls)
   in
   (** Proc arguments, used in forward and regular procedure declaration -
    *  This slightly over-complex function that could probably be more 
@@ -181,16 +188,19 @@ let convert oc cu =
         | _                 -> fprintf ppf "/* ERROR: can't address such an object with Read */")
     and pr_un_op ppf = function
       | (OpNot, e1)   -> fprintf ppf "(!%a)" pr_c_expr e1
-      | (OpMinus, e1) -> fprintf ppf "(-%a)" pr_c_expr e1
+      | (OpUMinus, e1) -> fprintf ppf "(-%a)" pr_c_expr e1
       | (OpBvNot, e1) -> fprintf ppf "(~%a)" pr_c_expr e1
       | (OpToInt, e1) -> fprintf ppf "((int) %a)" pr_c_expr e1
-      | (OpToByte, e1) -> fprintf ppf "((char) %a)" pr_c_expr e1
-      |  _            -> fprintf ppf "/* ERROR: no such unary operator. */"
+      | (OpToByte, e1) -> fprintf ppf "%a" pr_c_expr e1
+      | (OpUPlus, e1) -> fprintf ppf "((char) %a)" pr_c_expr e1
+      | ((OpLength | OpOld | OpArrayCells | OpArrayOfCell | OpIndexOfCell), _)  ->
+          fprintf ppf "/* ERROR: no such unary operator. */"
     and pr_bin_op ppf = function
       | (e1, OpMinus, e2) -> fprintf ppf "(%a - %a)"  pr_c_expr e1 pr_c_expr e2
       | (e1, OpPlus,  e2) -> fprintf ppf "(%a + %a)"  pr_c_expr e1 pr_c_expr e2
       | (e1, OpMult,  e2) -> fprintf ppf "(%a * %a)"  pr_c_expr e1 pr_c_expr e2 
       | (e1, OpDiv, e2)   -> fprintf ppf "(%a / %a)"  pr_c_expr e1 pr_c_expr e2
+      | (e1, OpMod, e2)   -> fprintf ppf "(%a %% %a)"  pr_c_expr e1 pr_c_expr e2
       | (e1, OpEq, e2)    -> fprintf ppf "(%a == %a)" pr_c_expr e1 pr_c_expr e2
       | (e1, OpGt, e2)    -> fprintf ppf "(%a > %a)"  pr_c_expr e1 pr_c_expr e2
       | (e1, OpLt, e2)    -> fprintf ppf "(%a < %a)"  pr_c_expr e1 pr_c_expr e2
@@ -208,20 +218,20 @@ let convert oc cu =
         fprintf ppf "/* ERROR: Sets not yet implemented */"
       | (_, (OpPts | OpSepStar | OpSepPlus | OpSepIncl), _) -> 
         fprintf ppf "/* ERROR: separation logic not yet implemented. */"
-      | _ -> fprintf ppf "/* ERROR: no such Binary Operator */"
+      (*| _ -> fprintf ppf "/* ERROR: no such Binary Operator */"*)
     and pr_c_expr ppf = function
       | (Null (_, _), _)           -> fprintf ppf "NULL"
       | (IntVal (i, _), _)         -> fprintf ppf "%s" (Int64.to_string i)
       | (BoolVal (b, _), _)        -> fprintf ppf (if b then "true" else "false")
       | (Read (from, index, _), cur_proc) -> pr_c_read ppf (from, index, cur_proc)
-      | (Length (idexp, _), cur_proc)     -> 
-        fprintf ppf "(%a->%s)" 
-          pr_c_expr (idexp, cur_proc)
-          len_field
       | (ProcCall (id, es, _), cur_proc)  ->
         fprintf ppf "%s(%a)"
           (string_of_ident id)
           pr_c_expr_args (es, cur_proc)
+      | (UnaryOp (OpLength, idexp, _), cur_proc) -> 
+        fprintf ppf "(%a->%s)" 
+          pr_c_expr (idexp, cur_proc)
+          len_field
       | (UnaryOp  (op, e, _), cur_proc)          -> pr_un_op  ppf (op, (e, cur_proc))
       | (BinaryOp (e1, op1, e2, _, _), cur_proc) -> 
         pr_bin_op ppf ((e1, cur_proc), op1, (e2, cur_proc))
@@ -235,7 +245,7 @@ let convert oc cu =
               fprintf ppf "%s"    (string_of_ident id)
       | (New (t, args, _), _)             ->
         fprintf ppf "/* ERROR: New expression only allowed directly within an Assign or Free stmt. */"
-      | ((Old _ | ArrayCells _|ArrayOfCell _|IndexOfCell _|Emp _|Setenum _|PredApp _|
+      | ((Emp _|Setenum _|PredApp _|
         Binder _| Annot _), _) ->
         fprintf ppf "/* ERROR: expression type not yet implemented. */"
     in
@@ -373,8 +383,7 @@ let convert oc cu =
           | _ -> fprintf ppf "/* ERROR: a variable of such a type cannot be disposed. */" 
         )
         | BinaryOp _ -> fprintf ppf "/* ERROR: freeing the result of binary operation will possibly be implemented in the future for freeing Sets. */" 
-        | (Old _ | Null _ | Emp _ | Setenum _ | IntVal _ | BoolVal _ | Length _ 
-        | ArrayOfCell _ | IndexOfCell _ | ArrayCells _ | PredApp _ | Binder _
+        | (Null _ | Emp _ | Setenum _ | IntVal _ | BoolVal _ | PredApp _ | Binder _
         | UnaryOp _ | Annot _) ->
             fprintf ppf "/* ERROR: expression cannot be dispsosed */"
       in 
@@ -521,7 +530,7 @@ let convert oc cu =
       free_SPLArray_proc_decl
   in
   let pr_c_struct_section ppf cu =
-    if (IdMap.is_empty cu.struct_decls) then
+    if (IdMap.is_empty cu.type_decls) then
       ()
     else
       fprintf ppf "@\n%s@\n%a@\n@\n%a"

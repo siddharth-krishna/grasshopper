@@ -46,7 +46,7 @@ let trd3 (_, _, v) = v
 %token <string> STRINGVAL
 %token LPAREN RPAREN LBRACE RBRACE LBRACKET RBRACKET
 %token COLON COLONEQ COLONCOLON SEMICOLON DOT PIPE
-%token UMINUS PLUS MINUS DIV TIMES
+%token UMINUS PLUS MINUS DIV TIMES MOD
 %token UNION INTER DIFF
 %token EQ NEQ LEQ GEQ LT GT IN NOTIN AT
 %token BOR BAND BNOT BSL BSR INT2BYTE BYTE2INT
@@ -55,7 +55,7 @@ let trd3 (_, _, v) = v
 %token <SplSyntax.binder_kind> QUANT
 %token ASSUME ASSERT CALL FREE HAVOC NEW RETURN
 %token IF ELSE WHILE
-%token GHOST IMPLICIT VAR STRUCT PURE PROCEDURE PREDICATE FUNCTION FOOTPRINT INCLUDE AXIOM
+%token GHOST IMPLICIT VAR STRUCT PURE PROCEDURE PREDICATE FUNCTION INCLUDE AXIOM TYPE
 %token OUTPUTS RETURNS REQUIRES ENSURES INVARIANT
 %token LOC INT BOOL BYTE SET MAP ARRAY ARRAYCELL
 %token MATCHING YIELDS WITHOUT COMMENT PATTERN
@@ -78,7 +78,7 @@ let trd3 (_, _, v) = v
 %nonassoc PTS LS
 %left PLUS MINUS
 %left UNION INTER DIFF
-%left TIMES DIV
+%left TIMES DIV MOD
 %nonassoc LPAREN
 
 %start main
@@ -96,12 +96,12 @@ declarations:
   { (fst3 $2, snd3 $2, ($1, mk_position 1 1) :: trd3 $2) }
 | include_cmd declarations 
   { (($1, mk_position 1 1) :: fst3 $2, snd3 $2, trd3 $2) }
+| type_decl declarations
+  { (fst3 $2, TypeDecl $1 :: snd3 $2, trd3 $2) }
 | proc_decl declarations 
   { (fst3 $2, ProcDecl $1 :: snd3 $2, trd3 $2) }
 | pred_decl declarations 
   { (fst3 $2, PredDecl $1 :: snd3 $2, trd3 $2) }
-| struct_decl declarations
-  { (fst3 $2, StructDecl $1 :: snd3 $2, trd3 $2) }
 | VAR var_decl SEMICOLON declarations
   { (fst3 $4, VarDecl $2 :: snd3 $4, trd3 $4) }
 | /* empty */ { ([], [], []) }
@@ -110,19 +110,30 @@ declarations:
 
 include_cmd:
 | INCLUDE STRINGVAL SEMICOLON { $2 }
-
+;
+  
 background_th:
 | AXIOM expr SEMICOLON { $2 }
+;
+  
+type_decl:
+| TYPE IDENT SEMICOLON {
+  { t_name = ($2, 0);
+    t_def = FreeTypeDef;
+    t_pos = mk_position 2 2 }
+}
+| struct_decl { $1 }
+;
 
 proc_decl:
-| proc_header { proc_decl $1 (Skip GrassUtil.dummy_position) }
+| proc_header { $1 }
 | proc_header proc_impl {
   proc_decl $1 $2
 } 
 ;
 
 proc_header:
-| PROCEDURE IDENT LPAREN var_decls RPAREN proc_returns proc_contracts {  
+| PROCEDURE IDENT LPAREN var_decls RPAREN proc_returns contracts {  
   let formals, locals0 =
     List.fold_right (fun decl (formals, locals0) ->
       decl.v_name :: formals, IdMap.add decl.v_name decl locals0)
@@ -147,12 +158,12 @@ proc_header:
 } 
 ;
 
-proc_contracts:
-| proc_contract proc_contracts { $1 :: $2 }
+contracts:
+| contract contracts { $1 :: $2 }
 | /* empty */ { [] }
 ;
 
-proc_contract:
+contract:
 | pure_opt REQUIRES expr semicolon_opt { Requires ($3, $1) }
 | pure_opt ENSURES expr semicolon_opt { Ensures ($3, $1) }
 ;
@@ -173,30 +184,7 @@ proc_impl:
 ;
 
 pred_decl:
-| PREDICATE IDENT LPAREN var_decls RPAREN LPAREN var_decls RPAREN LBRACE expr RBRACE {
-  let formals, locals =
-    List.fold_right (fun decl (formals, locals) ->
-      decl.v_name :: formals, IdMap.add decl.v_name decl locals)
-      $4 ([], IdMap.empty)
-  in
-  let footprints, locals =
-    List.fold_right (fun decl (footprints, locals) ->
-      decl.v_name :: footprints, IdMap.add decl.v_name decl locals)
-      $7 ([], locals)
-  in
-  let decl =
-    { pr_name = ($2, 0);
-      pr_formals = formals;
-      pr_outputs = [];
-      pr_footprints = footprints;
-      pr_locals = locals;
-      pr_body = $10;
-      pr_is_footprint = false;
-      pr_pos = mk_position 2 2;
-    }
-  in decl
-}
-| PREDICATE IDENT LPAREN var_decls RPAREN LBRACE expr RBRACE {
+| PREDICATE IDENT LPAREN var_decls RPAREN contracts pred_impl {
   let formals, locals =
     List.fold_right (fun decl (formals, locals) ->
       decl.v_name :: formals, IdMap.add decl.v_name decl locals)
@@ -206,16 +194,12 @@ pred_decl:
     { pr_name = ($2, 0);
       pr_formals = formals;
       pr_outputs = [];
-      pr_footprints = [];
       pr_locals = locals;
+      pr_contracts = $6;
       pr_body = $7;
-      pr_is_footprint = false;
       pr_pos = mk_position 2 2;
     }
   in decl
-}
-| function_header {
-  $1
 }
 | function_header pred_impl {
   pred_decl $1 $2
@@ -223,67 +207,39 @@ pred_decl:
 ;
 
 function_header:
-| footprint FUNCTION IDENT LPAREN var_decls RPAREN LPAREN var_decls RPAREN RETURNS LPAREN var_decls RPAREN {
+| FUNCTION IDENT LPAREN var_decls RPAREN RETURNS LPAREN var_decls RPAREN contracts {
   let formals, locals =
     List.fold_right (fun decl (formals, locals) ->
       decl.v_name :: formals, IdMap.add decl.v_name decl locals)
-      $5 ([], IdMap.empty)
+      $4 ([], IdMap.empty)
   in
-  let footprints, locals =
-    List.fold_right (fun decl (footprints, locals) ->
-      decl.v_name :: footprints, IdMap.add decl.v_name decl locals)
+  let outputs, locals =
+    List.fold_right (fun decl (outputs, locals) ->
+      decl.v_name :: outputs, IdMap.add decl.v_name decl locals)
       $8 ([], locals)
   in
-  let outputs, locals =
-    List.fold_right (fun decl (outputs, locals) ->
-      decl.v_name :: outputs, IdMap.add decl.v_name decl locals)
-      $12 ([], locals)
+  let contracts =
+    List.map (function Ensures (e, _) -> Ensures (e, true) | c -> c) $10
   in
   let decl =
-    { pr_name = ($3, 0);
+    { pr_name = ($2, 0);
       pr_formals = formals;
-      pr_footprints = footprints;
       pr_outputs = outputs;
       pr_locals = locals;
-      pr_body = BoolVal (true, GrassUtil.dummy_position);
-      pr_is_footprint = $1;
-      pr_pos = mk_position 3 3;
-    }
-  in decl
-}
-| footprint FUNCTION IDENT LPAREN var_decls RPAREN RETURNS LPAREN var_decls RPAREN {
-  let formals, locals =
-    List.fold_right (fun decl (formals, locals) ->
-      decl.v_name :: formals, IdMap.add decl.v_name decl locals)
-      $5 ([], IdMap.empty)
-  in
-  let outputs, locals =
-    List.fold_right (fun decl (outputs, locals) ->
-      decl.v_name :: outputs, IdMap.add decl.v_name decl locals)
-      $9 ([], locals)
-  in
-  let decl =
-    { pr_name = ($3, 0);
-      pr_formals = formals;
-      pr_footprints = [];
-      pr_outputs = outputs;
-      pr_locals = locals;
-      pr_body = BoolVal (true, GrassUtil.dummy_position);
-      pr_is_footprint = $1;
-      pr_pos = mk_position 3 3;
+      pr_contracts = contracts;
+      pr_body = None;
+      pr_pos = mk_position 2 2;
     }
   in decl
 }
 ;
-
-footprint:
-| FOOTPRINT { true }
-| /* empty */ { false }
   
 pred_impl:
 | LBRACE expr RBRACE {
-  $2
+  Some $2
 }
+| /* empty */ { None }
+
   
 var_decls:
 | var_decl var_decl_list { $1 :: $2 }
@@ -354,7 +310,7 @@ var_type:
 | ARRAYCELL LT var_type GT { ArrayCellType $3 }
 | SET LT var_type GT { SetType $3 }
 | MAP LT var_type COMMA var_type GT { MapType ($3, $5) }
-| IDENT { StructType ($1, 0) }
+| IDENT { IdentType ($1, 0) }
 ;
 
 proc_returns:
@@ -370,13 +326,13 @@ struct_decl:
       IdMap.empty $4
   in
   let decl = 
-    { s_name = ($2, 0);
-      s_fields = fields;
-      s_pos = mk_position 2 2;
-    } 
+    { t_name = ($2, 0);
+      t_def = StructTypeDef fields;
+      t_pos = mk_position 2 2;
+    }
   in
   decl
-}  
+}
 ;
 
 field_decls:
@@ -585,8 +541,8 @@ cast:
 unary_expr:
 | primary { $1 }
 | ident { $1 }
-| PLUS unary_expr { UnaryOp (OpPlus, $2, mk_position 1 2) }
-| MINUS unary_expr { UnaryOp (OpMinus, $2, mk_position 1 2) }
+| PLUS unary_expr { UnaryOp (OpUPlus, $2, mk_position 1 2) }
+| MINUS unary_expr { UnaryOp (OpUMinus, $2, mk_position 1 2) }
 | unary_expr_not_plus_minus { $1 }
 ;
 
@@ -606,6 +562,7 @@ mult_expr:
 | diff_expr  { $1 }
 | mult_expr TIMES diff_expr { BinaryOp ($1, OpMult, $3, IntType, mk_position 1 3) }
 | mult_expr DIV diff_expr { BinaryOp ($1, OpDiv, $3, IntType, mk_position 1 3) }
+| mult_expr MOD diff_expr { BinaryOp ($1, OpMod, $3, IntType, mk_position 1 3) }
 | mult_expr INTER diff_expr { BinaryOp ($1, OpInt, $3, SetType AnyType, mk_position 1 3) }
 | mult_expr BAND diff_expr { BinaryOp ($1, OpBvAnd, $3, IntType, mk_position 1 3) }
 ;
@@ -639,9 +596,14 @@ eq_expr:
 | eq_expr NEQ eq_expr { UnaryOp (OpNot, BinaryOp ($1, OpEq, $3, BoolType, mk_position 1 3), mk_position 1 3) }
 ;
 
-sep_star_expr:
+and_expr:
 | eq_expr { $1 }
-| sep_star_expr SEPSTAR eq_expr { BinaryOp ($1, OpSepStar, $3, PermType, mk_position 1 3) }
+| and_expr AND eq_expr { BinaryOp ($1, OpAnd, $3, AnyType, mk_position 1 3) }
+;
+
+sep_star_expr:
+| and_expr { $1 }
+| sep_star_expr SEPSTAR and_expr { BinaryOp ($1, OpSepStar, $3, PermType, mk_position 1 3) }
 ;
 
 sep_plus_expr:
@@ -654,14 +616,9 @@ sep_incl_expr:
 | sep_incl_expr SEPINCL sep_plus_expr { BinaryOp ($1, OpSepIncl, $3, PermType, mk_position 1 3) }
 ;
 
-and_expr:
-| sep_incl_expr { $1 }
-| and_expr AND sep_incl_expr { BinaryOp ($1, OpAnd, $3, AnyType, mk_position 1 3) }
-;
-
 or_expr:
-| and_expr { $1 }
-| or_expr OR and_expr { BinaryOp ($1, OpOr, $3, AnyType, mk_position 1 3) }
+| sep_incl_expr { $1 }
+| or_expr OR sep_incl_expr { BinaryOp ($1, OpOr, $3, AnyType, mk_position 1 3) }
 ;
 
 impl_expr:

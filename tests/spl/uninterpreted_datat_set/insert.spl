@@ -1,44 +1,44 @@
-
-struct Data { }
+type Data;
 
 struct Node {
   var next: Node;
   var data: Data;
 }
 
+predicate lt(x: Data, y: Data)
+
 axiom forall a: Data :: !lt(a, a);
 axiom forall a: Data, b: Data :: !lt(a, b) || !lt(b, a);
 axiom forall a: Data, b: Data :: lt(a, b) || lt(b, a) || a == b;
 axiom forall a: Data, b: Data, c: Data :: lt(a, b) && lt(b, c) ==> lt(a, c);
 
-predicate lt(x: Data, y: Data) { lt(x,y) }
-
-function lseg_footprint(x: Node, y: Node) returns (FP: Set<Node>) {
-  forall z: Node :: z in FP == (Btwn(next, x, z, y) && z != y)
+predicate lseg(x: Node, y: Node) {
+  acc({ z: Node :: Btwn(next, x, z, y) && z != y}) &*& Reach(next, x, y)
 }
 
-predicate lseg(x: Node, y: Node)(FP: Set<Node>) {
-  Btwn(next, x, y, y) && FP == lseg_footprint(x, y)
-}
-
-predicate lseg_strictly_increasing(x: Node, FP: Set<Node>) {
+predicate lseg_strictly_increasing(x: Node, FP: Set<Node>)
+  requires acc(FP)
+{
   forall y: Node, z: Node :: y in FP && z in FP && Btwn(next,x,y,z) ==> lt(y.data, z.data) || y == z
 }
 
-function data_witness(v: Data, d: Map<Node, Data>, FP: Set<Node>) returns (res: Node) 
+function data_witness(v: Data, FP: Set<Node>) returns (res: Node)
+  requires acc(FP)
+  ensures forall x in FP :: x == data_witness(x.data, FP)
 
-function content(FP: Set<Node>) returns (C: Set<Data>) {
-  (forall x in FP :: x == data_witness(x.data, data, FP)) &&
-  (forall x in FP :: x.data in C) &&
-  (forall v in C :: data_witness(v, data, FP) in FP) &&
-  (forall v: Data :: v !in C ==> data_witness(v, data, FP) == null) &&
-  (forall v in C :: v == data_witness(v, data, FP).data @(matching v yields data_witness(v, data, FP).data))
-}
+function content(FP: Set<Node>)
+  returns (C: Set<Data>)
+  requires acc(FP)
+  ensures forall x in FP :: x.data in C
+  ensures forall v in C :: data_witness(v, FP) in FP
+  ensures forall v: Data :: v !in C ==> data_witness(v, FP) == null
+  ensures forall v in C :: v == data_witness(v, FP).data @(matching v yields data_witness(v, FP).data)
 
-predicate list_set(x: Node, y: Node, C: Set<Data>)(FP: Set<Node>) {
-  lseg(x, y, FP) &&
-  lseg_strictly_increasing(x, FP) &&
-  C == content(FP)
+
+predicate list_set(x: Node, y: Node, C: Set<Data>) {
+  exists X: Set<Node> :: lseg(x, y) && acc(X) &*&
+    lseg_strictly_increasing(x, X) &&
+    C == content(X)
 }
 
 
@@ -46,7 +46,7 @@ procedure append(val: Data, x: Node, implicit ghost C: Set<Data>)
   returns (res: Node)
   requires list_set(x, null, C)
   requires forall v in C :: lt(val, v)
-  ensures list_set(res, null, C ++ Set(val))
+  ensures list_set(res, null, C ++ {val})
 {
   res := new Node;
   res.next := x;

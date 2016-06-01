@@ -24,7 +24,6 @@ let _ =
       ("false", BOOLVAL(false));
       ("forall", QUANT(SplSyntax.Forall));
       ("exists", QUANT(SplSyntax.Exists));
-      ("footprint", FOOTPRINT);
       ("free", FREE);
       ("function", FUNCTION);
       ("ghost", GHOST);
@@ -53,6 +52,7 @@ let _ =
       ("subsetof", LEQ);
       ("Set", SET);
       ("true", BOOLVAL(true));
+      ("type", TYPE);
       ("var", VAR);
       ("while", WHILE);
       ("without", WITHOUT);
@@ -134,6 +134,7 @@ rule token = parse
 | '-' { MINUS }
 | '/' { DIV }
 | '*' { TIMES }
+| '%' { MOD }
 | '(' { LPAREN }
 | ')' { RPAREN }
 | '{' { LBRACE }

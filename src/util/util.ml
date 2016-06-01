@@ -46,6 +46,10 @@ module Opt = struct
   let iter f = function
     | Some x -> f x
     | None -> ()
+
+  let some x = function
+    | None -> Some x
+    | o -> o
 end
 
 (** Utility functions on lists *)
@@ -172,7 +176,7 @@ let output_list chan fn sep xs =
   | first :: rest -> 
       fn first; List.iter (fun x -> output_string chan sep; fn x) rest
   | [] -> ()
-
+        
 (** Boolean operators on predicates *)
 
 let (~~) f x = not (f x)

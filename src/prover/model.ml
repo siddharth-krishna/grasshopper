@@ -311,6 +311,12 @@ let rec eval model = function
       let s1_val = find_set_value model (eval model s1) srt in
       let s2_val = find_set_value model (eval model s2) srt in
       B (ValueSet.subset s1_val s2_val)
+   | App (Ite, [c; t; e], _) ->
+      (match eval model c with
+        | B true -> eval model t
+        | B false -> eval model e
+        | I _ -> failwith "ITE expects a boolean condition"
+      )
    | App (sym, args, srt) ->
       let arg_srts, arg_vals = 
         List.split (List.map (fun arg -> sort_of arg, eval model arg) args)
@@ -576,7 +582,10 @@ let find_term model =
                     List.map (function
                       | Int -> [I Int64.zero]
                       | Bool -> [B false]
-                      | srt -> get_values_of_sort model srt)
+                      | srt ->
+                          match get_values_of_sort model srt with
+                          | v1 :: v2 :: v3 :: _ -> [v1; v2; v3]
+                          | vs -> vs)
                       arg_srts
                   in
                   let arg_product =
@@ -706,6 +715,7 @@ let find_term model =
     | Int -> mk_int64 (int_of_value v)
     | _ ->
         let sym, vs = SortedValueMap.find (v, srt) prev in
+        if List.mem (v, srt) vs then failwith "fixme";
         let args = List.map find vs in
         mk_app srt sym args
   in fun v srt -> find (v, srt)
@@ -886,7 +896,7 @@ type generic_graph_output = {
   }
 
 let graphviz_output =
-  let header chan = output_string chan "digraph Model {\n" in
+  let header chan = output_string chan "digraph Model {\ngraph[rankdir=LR];\n" in
   let footer chan = output_string chan "}\n" in
   let l = ref 0 in
   let out_tbl chan name assoc =
@@ -1150,8 +1160,7 @@ let mixed_graphviz_html =
     output_string chan "     min-height: inherit;\n";
     output_string chan "   }\n";
     output_string chan "  </style>\n";
-    output_string chan "  <script src=\"http://ariutta.github.io/svg-pan-zoom/dist/svg-pan-zoom.min.js\"></script>
-\n";
+    output_string chan "  <script src=\"http://ariutta.github.io/svg-pan-zoom/dist/svg-pan-zoom.min.js\"></script>\n";
     output_string chan "</head>\n";
     output_string chan "<body>\n";
     output_string chan "\n";
@@ -1520,10 +1529,10 @@ let print_graph output chan model terms =
             try
               let r = interp_symbol model Read read_arity [f; l] in
               if not (filter_null r) then 
-	        let label = string_of_term (find_term f fld_srt) in
                 try 
+	          let label = string_of_term (find_term f fld_srt) in
                   let src = get_node srt l in
-                  let dst = get_node srt r in
+                  let dst = get_node rsrt r in
                   edges := (src,dst,label,Solid,get_color fld_srt f) :: !edges
                 with _ -> ()
             with Undefined -> ())
@@ -1589,14 +1598,14 @@ let print_graph output chan model terms =
       output_reach ();
       output_eps ()
   in
-    SortSet.iter declare_locs loc_sorts;
-    SortSet.iter mk_graph loc_sorts;
-    output.header chan;
-    output.graph chan !nodes !edges;
-    output_sets ();
-    output_int_vars ();
-    output_freesyms ();
-    output.footer chan
+  SortSet.iter declare_locs loc_sorts;
+  SortSet.iter mk_graph loc_sorts;
+  output.header chan;
+  output.graph chan !nodes !edges;
+  output_sets ();
+  output_int_vars ();
+  output_freesyms ();
+  output.footer chan
  
 let output_html = print_graph mixed_graphviz_html
 let output_graph = print_graph graphviz_output

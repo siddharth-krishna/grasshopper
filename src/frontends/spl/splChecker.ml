@@ -8,18 +8,26 @@ open SplSyntax
 open SplErrors
 open SplTypeChecker
 
+  
 (** Resolve names of identifiers in compilation unit [cu] so that all identifiers have unique names.*)
-let resolve_names cu =
+let resolve_names cu = 
   let lookup_id init_id tbl pos =
     let name = GrassUtil.name init_id in
     match SymbolTbl.find tbl name with
     | Some (id, _) -> id
     | None -> unknown_ident_error init_id pos
   in 
-  let check_struct id structs pos =
-    if not (IdMap.mem id structs) then
-      not_a_struct_error id pos
+  let check_type id types pos =
+    if not (IdMap.mem id types) then
+      not_a_type_error id pos
   in
+  (*let check_struct id types pos =
+    check_type id types pos;
+    let decl = IdMap.find id types in
+    match decl.t_def with
+    | StructTypeDef _ -> ()
+    | _ -> not_a_struct_error id pos
+  in*)
   let check_proc id procs pos =
     if not (IdMap.mem id procs) then
       not_a_proc_error id pos
@@ -28,15 +36,24 @@ let resolve_names cu =
     if not (IdMap.mem id preds) then
       not_a_pred_error id pos
   in
-  (*let check_field id globals pos =
-    let error () = not_a_field_error id pos in
-    try 
-      let decl = IdMap.find id globals in
-      match decl.v_type with
-      | MapType (StructType _, _) -> ()
-      | _ -> error ()
-    with Not_found -> error ()
-  in*)
+  (* resolve names in type expressions *)
+  let resolve_typ types pos tbl =
+    let rec r = function
+    | IdentType init_id ->
+        let id = lookup_id init_id tbl pos in
+        check_type id types pos;
+        let decl = IdMap.find id types in
+        (match decl.t_def with
+        | StructTypeDef _ -> StructType id
+        | FreeTypeDef -> IdentType id)
+    | ArrayType ty -> ArrayType (r ty)
+    | ArrayCellType ty -> ArrayCellType (r ty)
+    | MapType (ty1, ty2) -> MapType (r ty1, r ty2)
+    | SetType ty -> SetType (r ty)
+    | ty -> ty
+    in
+    r
+  in
   let declare_name pos init_id scope tbl =
     let name = GrassUtil.name init_id in
     match SymbolTbl.find_local tbl name with
@@ -45,16 +62,9 @@ let resolve_names cu =
         let id = GrassUtil.fresh_ident name in
         (id, SymbolTbl.add tbl name (id, scope))
   in
-  let declare_var structs decl tbl =
+  let declare_var types decl tbl =
     let id, tbl = declare_name decl.v_pos decl.v_name decl.v_scope tbl in
-        let ty = 
-          match decl.v_type with
-          | StructType init_id ->
-              let id = lookup_id init_id tbl decl.v_pos in
-              check_struct id structs decl.v_pos;
-              StructType id
-          | ty -> ty
-        in
+        let ty = resolve_typ types decl.v_pos tbl decl.v_type in
         { decl with v_name = id; v_type = ty }, tbl
   in
   let declare_vars vars structs tbl = 
@@ -65,43 +75,40 @@ let resolve_names cu =
       vars (IdMap.empty, tbl)
   in
   let tbl = SymbolTbl.empty in
-  (* declare struct names *)
-  let structs0, tbl =
+  (* resolve type names *)
+  let types0, tbl =
     IdMap.fold 
       (fun init_id decl (structs, tbl) ->
-        let id, tbl = declare_name decl.s_pos init_id GrassUtil.global_scope tbl in
-        IdMap.add id { decl with s_name = id } structs, tbl)
-      cu.struct_decls (IdMap.empty, tbl)
+        let id, tbl = declare_name decl.t_pos init_id GrassUtil.global_scope tbl in
+        IdMap.add id { decl with t_name = id } structs, tbl)
+      cu.type_decls (IdMap.empty, tbl)
   in
-  (* declare global variables *)
-  let globals0, tbl = declare_vars cu.var_decls structs0 tbl in
+  (* resolve global variables *)
+  let globals0, tbl = declare_vars cu.var_decls types0 tbl in
   (* declare struct fields *)
-  let structs, globals, tbl =
+  let types, globals, tbl =
     IdMap.fold
-      (fun id decl (structs, globals, tbl) ->
-        let fields, globals, tbl =
-          IdMap.fold 
-            (fun init_id fdecl (fields, globals, tbl) ->
-              let id, tbl = declare_name fdecl.v_pos init_id GrassUtil.global_scope tbl in
-              let res_type = match fdecl.v_type with
-              | StructType init_id ->
-                  let id = lookup_id init_id tbl fdecl.v_pos in
-                  check_struct id structs0 fdecl.v_pos;
-                  StructType id
-              | ty -> ty
-              in
-              let typ = MapType (StructType decl.s_name, res_type) in
-              let fdecl = { fdecl with v_name = id; v_type = res_type } in
-              let gfdecl = { fdecl with v_type = typ } in
-              IdMap.add id fdecl fields, IdMap.add id gfdecl globals, tbl
-            )
-            decl.s_fields (IdMap.empty, globals, tbl)
-        in
-        IdMap.add id { decl with s_fields = fields } structs, 
-        globals, 
-        tbl
+      (fun id decl (types, globals, tbl) ->
+        match decl.t_def with
+        | StructTypeDef fields0 ->
+            let fields, globals, tbl =
+              IdMap.fold 
+                (fun init_id fdecl (fields, globals, tbl) ->
+                  let id, tbl = declare_name fdecl.v_pos init_id GrassUtil.global_scope tbl in
+                  let res_type = resolve_typ types0 fdecl.v_pos tbl fdecl.v_type in
+                  let typ = MapType (StructType decl.t_name, res_type) in
+                  let fdecl = { fdecl with v_name = id; v_type = res_type } in
+                  let gfdecl = { fdecl with v_type = typ } in
+                  IdMap.add id fdecl fields, IdMap.add id gfdecl globals, tbl
+                )
+                fields0 (IdMap.empty, globals, tbl)
+            in
+            IdMap.add id { decl with t_def = StructTypeDef fields } types, 
+            globals, 
+            tbl
+        | _ -> IdMap.add id decl types, globals, tbl
       )
-      structs0 (IdMap.empty, globals0, tbl)
+      types0 (IdMap.empty, globals0, tbl)
   in
   (* declare procedure names *)
   let procs0, tbl =
@@ -120,53 +127,40 @@ let resolve_names cu =
   let cu = 
     { cu with
       var_decls = globals; 
-      struct_decls = structs; 
+      type_decls = types; 
       proc_decls = procs0;
       pred_decls = preds0;
     }
   in
   let resolve_expr locals tbl e =
-    let rec re_ty pos tbl = function
-      | StructType init_id ->
-          let id = lookup_id init_id tbl pos in
-          check_struct id structs pos;
-          StructType id
-      | SetType ty ->
-          SetType (re_ty pos tbl ty)
-      | ArrayType ty ->
-          ArrayType (re_ty pos tbl ty)
-      | MapType (dty, rty) ->
-          MapType (re_ty pos tbl dty, re_ty pos tbl rty)
-      | ty -> ty
-    in
     let rec re locals tbl = function
       | Setenum (ty, args, pos) ->
-          let ty1 = re_ty pos tbl ty in
+          let ty1 = resolve_typ types pos tbl ty in
           let args1 = List.map (re locals tbl) args in
           Setenum (ty1, args1, pos)
       | New (ty, args, pos) ->
-          let ty1 = re_ty pos tbl ty in 
+          let ty1 = resolve_typ types pos tbl ty in 
           let args1 =  List.map (re locals tbl) args in
           New (ty1, args1, pos)
       | Read ((Ident (("length", _), _) as map), idx, pos) ->
           let idx1 = re locals tbl idx in
           (match type_of_expr cu locals idx1 with
-          | ArrayType _ | AnyType -> Length (idx1, pos)
+          | ArrayType _ | AnyType -> UnaryOp (OpLength, idx1, pos)
           | ty -> Read (re locals tbl map, idx1, pos))
       | Read ((Ident (("cells", _), _) as map), idx, pos) ->
           let idx1 = re locals tbl idx in
           (match type_of_expr cu locals idx1 with
-          | ArrayType _ | AnyType -> ArrayCells (idx1, pos)
+          | ArrayType _ | AnyType -> UnaryOp (OpArrayCells, idx1, pos)
           | _ -> Read (re locals tbl map, idx1, pos))
       | Read ((Ident (("array", _), _) as map), idx, pos) ->
           let idx1 = re locals tbl idx in
           (match type_of_expr cu locals idx1 with
-          | ArrayCellType _ | AnyType -> ArrayOfCell (idx1, pos)
+          | ArrayCellType _ | AnyType -> UnaryOp (OpArrayOfCell, idx1, pos)
           | _ -> Read (re locals tbl map, idx1, pos))
       | Read ((Ident (("index", _), _) as map), idx, pos) ->
           let idx1 = re locals tbl idx in
           (match type_of_expr cu locals idx1 with
-          | ArrayCellType _ | AnyType -> IndexOfCell (idx1, pos)
+          | ArrayCellType _ | AnyType -> UnaryOp (OpIndexOfCell, idx1, pos)
           | _ -> Read (re locals tbl map, idx1, pos))
       | Read (map, idx, pos) ->
           Read (re locals tbl map, re locals tbl idx, pos)
@@ -179,7 +173,7 @@ let resolve_names cu =
                 let id, tbl1 = declare_name pos init_id pos tbl in
                 (GuardedVar (id, e1)), (locals, tbl1) 
               | UnguardedVar decl ->
-                let decl, tbl1 = declare_var structs decl tbl in
+                let decl, tbl1 = declare_var types decl tbl in
                 (UnguardedVar decl), (IdMap.add decl.v_name decl locals, tbl1)
               )
               (locals, tbl)
@@ -201,7 +195,7 @@ let resolve_names cu =
               | ArrayType typ ->
                   let map1 = re locals tbl map in
                   let idx1 = re locals tbl idx in
-                  let cell = Read (ArrayCells (map1, pos_of_expr map1), idx1, pos) in
+                  let cell = Read (UnaryOp (OpArrayCells, map1, pos_of_expr map1), idx1, pos) in
                   PredApp (AccessPred, [Setenum (ArrayCellType typ, [cell], pos)], pos)
               | _ -> pred_arg_mismatch_error pos id 1)
           | _ -> pred_arg_mismatch_error pos id 1)
@@ -209,7 +203,7 @@ let resolve_names cu =
           let args1 = List.map (re locals tbl) args in
           (match GrassUtil.name init_id with
           | "old" ->
-              Old(List.hd args1, pos)
+              UnaryOp (OpOld, List.hd args1, pos)
           | "Btwn" ->
               PredApp (BtwnPred, args1, pos)
           | "Reach" ->
@@ -290,7 +284,7 @@ let resolve_names cu =
                       { decl with v_type = ty }
                   | _ -> decl
                 in
-                let decl, tbl = declare_var structs decl tbl in
+                let decl, tbl = declare_var types decl tbl in
                 Ident (decl.v_name, decl.v_pos) :: ids, 
                 IdMap.add decl.v_name decl locals, 
                 tbl
@@ -337,28 +331,29 @@ let resolve_names cu =
         Return (List.map (resolve_expr locals tbl) es, pos), locals, tbl
   in
   (* declare and resolve local variables *)
+  let resolve_contracts contracts returns locals tbl =
+    let pre_locals, pre_tbl =
+      List.fold_left
+        (fun (pre_locals, pre_tbl) id ->
+          IdMap.remove id pre_locals,
+          SymbolTbl.remove pre_tbl (GrassUtil.name id))
+        (locals, tbl)
+        returns
+    in
+    List.map 
+      (function 
+        | Requires (e, pure) -> Requires (resolve_expr pre_locals pre_tbl e, pure)
+        | Ensures (e, pure) -> Ensures (resolve_expr locals tbl e, pure)
+      )
+      contracts
+  in
   let procs =
     IdMap.fold
       (fun _ decl procs ->
-        let locals0, tbl0 = declare_vars decl.p_locals structs (SymbolTbl.push tbl) in
+        let locals0, tbl0 = declare_vars decl.p_locals types (SymbolTbl.push tbl) in
         let formals = List.map (fun id -> lookup_id id tbl0 decl.p_pos) decl.p_formals in
         let returns = List.map (fun id -> lookup_id id tbl0 decl.p_pos) decl.p_returns in
-        let contracts =
-          let pre_locals, pre_tbl =
-            List.fold_left
-              (fun (pre_locals, pre_tbl) id ->
-                IdMap.remove id pre_locals,
-                SymbolTbl.remove pre_tbl (GrassUtil.name id))
-              (locals0, tbl0)
-              returns
-          in
-          List.map 
-            (function 
-              | Requires (e, pure) -> Requires (resolve_expr pre_locals pre_tbl e, pure)
-              | Ensures (e, pure) -> Ensures (resolve_expr locals0 tbl0 e, pure)
-            )
-            decl.p_contracts
-        in
+        let contracts = resolve_contracts decl.p_contracts returns locals0 tbl0 in
         let body, locals, _ = resolve_stmt true false locals0 tbl0 decl.p_body in
         let decl1 = 
           { decl with 
@@ -375,19 +370,17 @@ let resolve_names cu =
   let preds =
     IdMap.fold
       (fun _ decl preds ->
-        let locals, tbl = declare_vars decl.pr_locals structs (SymbolTbl.push tbl) in
-        let body = resolve_expr locals tbl decl.pr_body in
+        let locals, tbl = declare_vars decl.pr_locals types (SymbolTbl.push tbl) in
+        let body = Opt.map (resolve_expr locals tbl) decl.pr_body in
         let formals = List.map (fun id -> lookup_id id tbl decl.pr_pos) decl.pr_formals in
-        let footprints =
-          List.map (fun id -> lookup_id id tbl decl.pr_pos) decl.pr_footprints
-        in
         let outputs = List.map (fun id -> lookup_id id tbl decl.pr_pos) decl.pr_outputs in
+        let contracts = resolve_contracts decl.pr_contracts outputs locals tbl in
         let decl1 = 
           { decl with 
             pr_formals = formals;
-            pr_footprints = footprints;
             pr_outputs = outputs; 
-            pr_locals = locals; 
+            pr_locals = locals;
+            pr_contracts = contracts;
             pr_body = body 
           } 
         in
@@ -402,7 +395,7 @@ let resolve_names cu =
   in
   { cu with 
     var_decls = globals; 
-    struct_decls = structs; 
+    type_decls = types; 
     proc_decls = procs;
     pred_decls = preds;
     background_theory = bg_theory;
@@ -464,12 +457,8 @@ let flatten_exprs cu =
               | [UnguardedVar decl] -> decl
               | _ -> failwith "unexpected set comprehension"
             in
-            let elem_type = v_decl.v_type in
             let sc_id = GrassUtil.fresh_ident "set_compr" in
             let sc_locals = IdMap.add v_decl.v_name v_decl IdMap.empty in
-            let sc_ret_id, sc_locals = decl_aux_var "X" (SetType elem_type) pos scope sc_locals in
-            let v = Ident (v_decl.v_name, v_decl.v_pos) in
-            let r = Ident (sc_ret_id, pos) in
             let fv = IdSet.elements (free_vars e) in
             let formals = List.filter (fun id -> IdMap.mem id locals) fv in
             let sc_locals =
@@ -477,17 +466,13 @@ let flatten_exprs cu =
                 (fun sc_locals id -> IdMap.add id (IdMap.find id locals) sc_locals)
                 sc_locals formals
             in
-            let sc_body =
-              Binder (Forall, [UnguardedVar v_decl], BinaryOp (BinaryOp (v, OpIn, r, BoolType, pos), OpEq, f1, BoolType, pos), pos)
-            in
             let sc_decl =
               { pr_name = sc_id;
                 pr_formals = formals;
-                pr_footprints = [];
-                pr_outputs = [sc_ret_id];
+                pr_outputs = [];
                 pr_locals = sc_locals;
-                pr_body = sc_body;
-                pr_is_footprint = false;
+                pr_contracts = [];
+                pr_body = Some e;
                 pr_pos = pos;
               }
             in
@@ -631,19 +616,68 @@ let flatten_exprs cu =
         let es1, (aux_cmds, aux_funs), locals = flatten_expr_list scope ([], aux_funs) locals es in
         mk_block pos (aux_cmds @ [Return (es1, pos)]), locals, aux_funs
   in
+  let flatten_contracts aux_funs locals contracts =
+    List.fold_right
+      (fun c (contracts, aux_funs, locals) ->
+        let flatten_spec e =
+          let e1, (aux_cmds, aux_funs), locals =
+            flatten_expr (pos_of_expr e) ([], aux_funs) locals e
+          in
+          match aux_cmds with
+          | [] -> e1, aux_funs, locals
+          | cmd :: _ -> illegal_side_effect_error (pos_of_stmt cmd) "specifications"
+        in
+        match c with
+        | Requires (e, pure) -> 
+            let e1, aux_funs, locals = flatten_spec e in
+            Requires (e1, pure) :: contracts, aux_funs, locals
+        | Ensures (e, pure) ->
+            let e1, aux_funs, locals = flatten_spec e in
+            Ensures (e1, pure) :: contracts, aux_funs, locals)
+      contracts ([], aux_funs, locals)
+  in
   let procs, aux_funs =
     IdMap.fold
       (fun _ decl (procs, aux_funs) ->
-        let body, locals, aux_funs = flatten decl.p_pos decl.p_locals aux_funs decl.p_returns decl.p_body in
-        let decl1 = { decl with p_locals = locals; p_body = body } in
+        let contracts, aux_funs, locals =
+          flatten_contracts aux_funs decl.p_locals decl.p_contracts
+        in
+        let body, locals, aux_funs =
+          flatten decl.p_pos locals aux_funs decl.p_returns decl.p_body
+        in
+        let decl1 =
+          { decl with
+            p_locals = locals;
+            p_contracts = contracts;
+            p_body = body }
+        in
         IdMap.add decl.p_name decl1 procs, aux_funs)
       cu.proc_decls (IdMap.empty, [])
   in
   let preds, aux_funs =
     IdMap.fold
       (fun _ decl (preds, aux_funs) ->
-        let body, (_, aux_funs), locals = flatten_expr decl.pr_pos ([], aux_funs) decl.pr_locals decl.pr_body in
-        let decl1 = { decl with pr_locals = locals; pr_body = body } in
+        let contracts, aux_funs, locals =
+          flatten_contracts aux_funs decl.pr_locals decl.pr_contracts
+        in
+        let body, (aux_cmds, aux_funs), locals =
+          match decl.pr_body with
+          | Some body ->
+              let body, aux, locals = flatten_expr decl.pr_pos ([], aux_funs) decl.pr_locals body in
+              Some body, aux, locals
+          | None -> None, ([], aux_funs), locals
+        in
+        match aux_cmds with
+        | cmd :: _ ->
+            illegal_side_effect_error (pos_of_stmt cmd) "function and procedure bodies"
+        | _ -> ();
+        let decl1 =
+          { decl with
+            pr_locals = locals;
+            pr_contracts = contracts;
+            pr_body = body  
+          }
+        in
         IdMap.add decl.pr_name decl1 preds, aux_funs)
       cu.pred_decls (IdMap.empty, [])
   in
@@ -755,18 +789,26 @@ let infer_types cu =
   let preds =
     IdMap.fold
       (fun id pred preds ->
-        let body = infer_types cu pred.pr_locals BoolType pred.pr_body in
-        let _ =
-          List.iter (fun vid ->
-            let vdecl = IdMap.find vid pred.pr_locals in
-            match vdecl.v_type with
-            | SetType (StructType _)
-            | SetType (ArrayType _)
-            | SetType (ArrayCellType _) -> ()
-            | _ -> footprint_declaration_error vid vdecl.v_pos)
-            pred.pr_footprints
+        let rtype =
+          match pred.pr_outputs with
+          | [res_id] ->
+              (IdMap.find res_id pred.pr_locals).v_type
+          | _ -> PermType
         in
-        let pred1 = { pred with pr_body = body } in
+        let contracts =
+          List.map (function
+            | Requires (e, pure) -> Requires (check_spec pred.pr_locals pure e, pure)
+            | Ensures (e, pure) -> Ensures (check_spec pred.pr_locals pure e, pure)) pred.pr_contracts
+        in
+        let body =
+          Opt.map (infer_types cu pred.pr_locals rtype) pred.pr_body
+        in
+        let pred1 =
+          { pred with
+            pr_contracts = contracts;
+            pr_body = body
+          }
+        in
         IdMap.add id pred1 preds)
       cu.pred_decls IdMap.empty
   in

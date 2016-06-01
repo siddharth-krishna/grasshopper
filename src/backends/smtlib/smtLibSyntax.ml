@@ -16,7 +16,7 @@ type symbol =
   | IntConst of int
   | BvConst of int * Int64.t
   | Ident of ident
-  | Minus | Plus | Mult | Div
+  | Minus | Plus | Mult | Div | Mod
   | Eq | Gt | Lt | Geq | Leq
   | And | Or | Impl | Not | Ite
   (* bitvector theory *)
@@ -211,6 +211,12 @@ let unletify t =
       Annot (ul t, a, pos)
   in ul t
 
+let pos_of_term = function
+  | App (_, _, pos)
+  | Binder (_, _, _, pos)
+  | Let (_, _, pos)
+  | Annot (_, _, pos) -> pos
+
 (** Pretty printing *)
 
 open Format
@@ -260,6 +266,7 @@ let string_of_symbol = function
   | Minus -> "-"
   | Mult -> "*"
   | Div -> "div"
+  | Mod -> "mod"
   | Eq -> "="
   | Leq -> "<="
   | Geq -> ">="

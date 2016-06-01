@@ -64,7 +64,7 @@ let generated_ground_terms fs =
 let elim_exists =
   let e = fresh_ident "?e" in
   let rec elim_neq bvs = function
-    | BoolOp (Not, [Atom (App (Eq, [s1; s2], _), a)]) as f ->
+    | BoolOp (Not, [Atom (App (Eq, [s1; s2], _), a)]) as f when bvs = [] ->
 	(match sort_of s1 with
 	| Set srt ->
 	    let ve = mk_var srt e in
@@ -87,7 +87,7 @@ let elim_exists =
   in
   List.map (fun f -> 
     let f1 = elim_neq [] f in
-    let f2 = propagate_exists f1 in
+    let f2 = propagate_exists_up f1 in
     skolemize f2)
 
 (** Hoist all universally quantified subformulas to top level.
@@ -251,11 +251,13 @@ let add_set_axioms fs =
         let srt = element_sort_of_set t1 in
         let t11 = unflatten t1 in
         let t21 = unflatten t2 in
-        Atom (mk_eq_term (mk_empty (Set srt)) (mk_inter [t11; t21]), a)
+        mk_and [mk_disjoint t11 t21;
+                Atom (mk_eq_term (mk_empty (Set srt)) (mk_inter [t11; t21]), a)]
     | Atom (App (SubsetEq, [t1; t2], _), a) when not !Config.abstract_preds -> 
         let t11 = unflatten t1 in
         let t21 = unflatten t2 in
-        Atom (mk_eq_term t21 (mk_union [t11; t21]), a)
+        mk_and [mk_subseteq t11 t21;
+                Atom (mk_eq_term t21 (mk_union [t11; t21]), a)]
     | Atom (t, a) -> Atom (unflatten t, a)
   in
   let fs1 = List.map simplify fs in
@@ -344,27 +346,33 @@ let add_read_write_axioms fs =
           let set2 = Axioms.set2 ssrt in
           (* f = g, x.f -> x.g *)
           ([Match (mk_eq_term fld1 fld2, []);
-            Match (mk_read fld1 loc1, [])],
+            Match (mk_read fld1 loc1, []);
+            Match (loc2, [FilterNotNull])],
            [mk_read fld2 loc1]) ::
           (* f = g, x.g -> x.f *)
           ([Match (mk_eq_term fld1 fld2, []);
-            Match (mk_read fld2 loc1, [])],
+            Match (mk_read fld2 loc1, []);
+            Match (loc1, [FilterNotNull])],
            [mk_read fld1 loc1]) :: 
           (* f [x := d], y.(f [x := d]) -> y.f *)
           ([Match (mk_write fld1 loc1 dvar, []);
-            Match (mk_read (mk_write fld1 loc1 dvar) loc2, [])],
+            Match (mk_read (mk_write fld1 loc1 dvar) loc2, []);
+            Match (loc2, [FilterNotNull])],
            [mk_read fld1 loc2]) ::
           (* f [x := d], y.f -> y.(f [x := d]) *)
           ([Match (mk_write fld1 loc1 dvar, []);
-            Match (mk_read fld1 loc2, [])],
+            Match (mk_read fld1 loc2, []);
+            Match (loc2, [FilterNotNull])],
            [mk_read (mk_write fld1 loc1 dvar) loc2]) ::
           (* Frame (x, a, f, g), y.g -> y.f *)
           ([Match (mk_frame_term set1 set2 fld1 fld2, []);
-            Match (mk_read fld2 loc1, [])],
+            Match (mk_read fld2 loc1, []);
+            Match (loc1, [FilterNotNull])],
            [mk_read fld1 loc1]) ::
           (* Frame (x, a, f, g), y.f -> y.g *)
           ([Match (mk_frame_term set1 set2 fld1 fld2, []);
-            Match (mk_read fld1 loc1, [])],
+            Match (mk_read fld1 loc1, []);
+            Match (loc2, [FilterNotNull])],
            [mk_read fld2 loc1]) ::
           propagators
       | _ -> fun propagators -> propagators)
@@ -409,7 +417,24 @@ let add_array_axioms fs gts =
   let srts = array_sorts gts in
   let axioms = SortSet.fold (fun srt axioms -> Axioms.array_axioms srt @ axioms) srts [] in
   axioms @ fs
-  
+
+
+let terms_from_neg_assert fs =
+  let has_label = List.exists (function Label _ -> true | _ -> false) in
+  let rec process_form terms = function
+    | Atom (_, anns) as f ->
+      if has_label anns then
+        ground_terms ~include_atoms:true f |> TermSet.union terms
+      else terms
+    | BoolOp (_, fs) -> process_forms terms fs
+    | Binder (_, _, f1, anns) as f ->
+      if has_label anns then
+        ground_terms ~include_atoms:true f |> TermSet.union terms
+      else process_form terms f1
+  and process_forms terms fs = List.fold_left process_form terms fs
+  in
+  process_forms TermSet.empty fs
+           
 let instantiate read_propagators fs gts =
   (* generate local instances of all remaining axioms in which variables occur below function symbols *)
   let fs1, generators = open_axioms isFunVar fs in
@@ -429,35 +454,50 @@ let instantiate read_propagators fs gts =
         TermSet.iter (fun t -> print_endline ("  " ^ (string_of_term t))) (TermSet.diff gts1 gts)
       end
   in
-  let rec is_equation = function
-    | BoolOp (_, fs) -> List.for_all is_equation fs
-    | Binder (Forall, _, f, _) -> is_equation f
-    | Atom (App (Eq, _, _), _) -> true
-    | Atom (App (FreeSym _, _, _), _) -> true
-    | _ -> false
+  let core_terms =
+    let gts_a = terms_from_neg_assert fs in
+    TermSet.fold (fun t acc ->
+      match sort_of t with
+      | Loc _ | Int -> TermSet.add (mk_known t) acc
+      | _ -> acc)
+      gts_a TermSet.empty
   in
-  let equations, others = List.partition is_equation fs1 in
+  let gts1 = TermSet.union gts1 core_terms in
+  let rec is_horn seen_pos = function
+    | BoolOp (Or, fs) :: gs -> is_horn seen_pos (fs @ gs)
+    | Binder (Forall, [], f, _) :: gs -> is_horn seen_pos (f :: gs)
+    | (Atom (App ((Eq | FreeSym _ | SubsetEq | Disjoint), _, _), _)) :: gs ->
+        (not seen_pos && is_horn true gs)
+    | BoolOp (And, fs) :: gs ->
+        List.for_all (fun f -> is_horn seen_pos [f]) gs && is_horn true gs
+    | BoolOp (Not, [Atom (App ((Eq | FreeSym _ | SubsetEq | Disjoint) , _, _), _)]) :: gs ->
+        is_horn seen_pos gs
+    | _ :: _ -> false
+    | [] -> true
+    (*| BoolOp (_, fs) -> List.for_all is_horn fs
+    | Binder (Forall, [], f, _) -> is_horn f
+    | Atom (App ((FreeSym _ | Eq | Disjoint | SubsetEq), _, _), _) -> true
+    | _ -> false*)
+  in
+  let equations, others = List.partition (fun f -> is_horn false [f]) fs1 in
   let classes = CongruenceClosure.congr_classes fs gts1 in
   let eqs = instantiate_with_terms true equations classes in
   let gts1 = TermSet.union (ground_terms ~include_atoms:true (mk_and eqs)) gts1 in 
   let classes = CongruenceClosure.congr_classes (List.rev_append eqs fs) gts1 in
   let implied =
     List.fold_left
-      (fun acc cls ->
-        if (List.length cls > 1 && sort_of (List.hd cls) <> Bool) then
-          let h = List.hd cls in
-          let eq = List.map (fun t -> GrassUtil.mk_eq h t) (List.tl cls) in
-          List.rev_append eq acc
-        else
-          acc
-      )
+      (fun acc -> function
+        | c :: cls when sort_of c <> Bool && sort_of c <> Pat -> 
+            let eq = List.map (fun t -> GrassUtil.mk_eq c t) cls in
+            List.rev_append eq acc
+        | _ -> acc)
       []
       classes
-  in
+    in
   let fs2, gts2 =
     let fs1 = instantiate_with_terms true others classes in
     let gts_inst = generated_ground_terms (List.rev_append eqs fs1) in
-    let gts2 = generate_terms (read_propagators @ btwn_gen @ generators) gts_inst in
+    let gts2 = generate_terms (read_propagators @ btwn_gen @ generators) (TermSet.union gts_inst core_terms) in
     if TermSet.subset gts2 gts_inst
     then fs1, gts1
     else
@@ -551,37 +591,11 @@ let add_split_lemmas fs gts =
     
 (** Reduces the given formula to the target theory fragment, as specified by the configuration. *)
 let reduce f =
-  (* split f into conjuncts and eliminate all existential quantifiers and annots *)
-  let rec split_ands acc = function
-    | BoolOp(And, fs) :: gs -> 
-        split_ands acc (fs @ gs)
-    | Binder(_, [], BoolOp(And, fs), a) :: gs ->
-        split_ands acc (List.map (fun f -> annotate f a) fs @ gs)
-    | f :: gs ->
-        split_ands (f :: acc) gs
-    | [] -> List.rev acc
-  in
+  (* split f into conjuncts and eliminate all existential quantifiers *)
   let f1 = nnf f in
-  let fs = split_ands [] [f1] in
+  let fs = elim_exists [f1] in
+  let fs = split_ands fs in
   (* *)
-  let fs = elim_exists fs in
-  (* print_endline "\n----------\nForms with ErrorMsg";
-  let rec form_has_annot = function
-    | (Atom (_, anns)) as f ->
-      if List.exists (function | Label ("VCLabel", _) -> true | _ -> false) anns then
-        print_endline ((string_of_form f) ^ "\n--")
-    | (Binder (_, _, fs, anns)) as f ->
-      if List.exists (function | Label ("VCLabel", _) -> true | _ -> false) anns then
-      (* if List.length anns > 0 then *)
-        print_endline ((string_of_form f) ^ "\n--")
-      else
-        form_has_annot fs
-    | BoolOp (_, fs) ->
-      List.iter form_has_annot fs
-  in
-  List.iter form_has_annot fs;
-  print_endline "------------\n"; *)
-
   (* no reduction step should introduce implicit or explicit existential quantifiers after this point *)
   (* some formula rewriting that helps the SMT solver *)
   let fs = massage_field_reads fs in
@@ -589,12 +603,13 @@ let reduce f =
   let fs = pull_up_equalities fs in
   let fs = add_ep_axioms fs in
   let fs = add_frame_axioms fs in
-  let fs = factorize_axioms (split_ands [] fs) in
+  let fs = factorize_axioms (split_ands fs) in
   let fs = add_set_axioms fs in
   let fs, read_propagators, gts = add_read_write_axioms fs in
   let fs, gts = add_reach_axioms fs gts in
   let fs = add_array_axioms fs gts in
   let fs = if !Config.named_assertions then fs else List.map strip_names fs in
+  let fs = fs |> split_ands in
   let _ =
     if Debug.is_debug 1 then begin
       print_endline "VC before instantiation:";

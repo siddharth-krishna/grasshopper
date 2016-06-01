@@ -1,5 +1,6 @@
 (** {5 Verification of GRASS programs} *)
 
+open Util
 open Grass
 open GrassUtil
 open Prog
@@ -10,27 +11,29 @@ open Grassifier
 let simplify prog =
   let dump_if n prog = 
     if !Config.dump_ghp == n 
-    then print_prog stdout prog 
-    else ()
+    then (print_prog stdout prog; prog)
+    else prog
   in
-  dump_if 0 prog;
-  Debug.info (fun () -> "Inferring accesses, eliminating loops, arrays, new/dispose, and global dependencies.\n");
-  let prog = elim_arrays prog in
-  let prog = elim_new_dispose prog in
-  let prog = Analyzer.infer_accesses prog in
-  let prog = elim_loops prog in
-  let prog = elim_global_deps prog in
-  dump_if 1 prog;
-  Debug.info (fun () -> "Eliminating SL, adding heap access checks.\n");
-  let prog = elim_sl prog in
-  let prog = if !Config.abstract_preds then annotate_frame_axioms prog else prog in
-  let prog = annotate_heap_checks prog in
-  dump_if 2 prog;
-  Debug.info (fun () -> "Eliminating return statements and transforming to SSA form.\n");
-  let prog = elim_return prog in
-  let prog = elim_state prog in
-  dump_if 3 prog;
-  prog
+  let info msg prog = Debug.info (fun () -> msg); prog in
+  prog |>
+  dump_if 0 |>
+  info "Inferring accesses, eliminating loops, arrays, new/dispose, and global dependencies.\n" |>
+  elim_arrays |>
+  elim_new_dispose |>
+  Analyzer.infer_accesses |>
+  elim_loops |>
+  elim_global_deps |>
+  dump_if 1 |>
+  info "Eliminating SL, adding heap access checks.\n" |>
+  elim_sl |>
+  (*(fun prog -> if !Config.abstract_preds then annotate_frame_axioms prog else prog) |> *)
+  (*annotate_term_generators |>*)
+  annotate_heap_checks |>
+  dump_if 2 |>
+  info "Eliminating return statements and transforming to SSA form.\n" |>
+  elim_return |>
+  elim_state |>
+  dump_if 3
 
 (** Annotate [msg] as comment to leaves of formula [f] *)
 let annotate_aux_msg msg f = 
@@ -87,21 +90,101 @@ let add_labels vc =
 
 (** Expand predicate definitions for all predicates in formula [f] according to program [prog] *)
 let add_pred_insts prog f =
+  (* Annotates term generators in predicate bodies *)
+  let annotate_term_generators pred f =
+    let locals = locals_of_pred pred in
+    let formals = formals_of_pred pred in
+    let returns = returns_of_pred pred in
+    let name = name_of_pred pred in
+    let fun_terms bvs f =
+      let rec ft acc = function
+        | App (sym, _ :: _, srt) as t
+          when is_free_symbol sym || sym = Disjoint || sym = Disjoint || srt <> Bool ->
+            let fvs = fv_term t in
+            if IdSet.subset fvs bvs && not @@ IdSet.is_empty (fv_term t)
+            then TermSet.add t acc else acc
+        | App (_, ts, _) ->
+            List.fold_left ft acc ts
+        | _ -> acc
+      in
+      fold_terms ft TermSet.empty f
+    in
+    let sorted_vs =
+      List.map
+        (fun x ->
+          let var = IdMap.find x locals in
+          x, var.var_sort)
+        formals
+    in
+    let pvs = List.map (fun (x, srt) -> mk_var srt x) sorted_vs in
+    let mt, kgen = match returns with
+    | [] ->
+        let mt = mk_free_fun Bool name pvs in
+        mt, [TermGenerator ([Match (mt, [])], [mk_known mt])]
+    | [x] ->
+        let var = IdMap.find x locals in
+        mk_free_fun var.var_sort name pvs, []
+    | _ -> failwith "Functions may only have a single return value."
+    in
+    let m = Match (mt, []) in
+    let rec add_match = function
+      | Binder (b, vs, f, annots) ->
+          let annots1 =
+            List.map (function TermGenerator (ms, ts) -> TermGenerator (m :: ms, ts) | a -> a) annots
+          in
+          Binder (b, vs, add_match f, annots1)
+      | BoolOp (op, fs) ->
+          BoolOp (op, List.map add_match fs)
+      | f -> f
+    in
+    let rec add_generators bvs = function
+      | BoolOp (op, fs) ->
+          BoolOp (op, List.map (add_generators bvs) fs)
+      | Binder (Forall, vs, f, ann) ->
+          let bvs = List.fold_left (fun bvs (v, _) -> IdSet.add v bvs) bvs vs in
+          let pvs = id_set_of_list @@ List.map fst sorted_vs in
+          let ft =
+            f |>
+            fun_terms bvs |>
+            TermSet.elements |>
+            List.map
+              (function
+                | App (Disjoint, [t1; t2], _) -> mk_inter [t1; t2]
+                | App (SubsetEq, [t1; t2], _) -> mk_union [t1; t2]
+                | t -> t) |>
+            List.filter (fun t -> t <> mt && IdSet.subset (fv_term t) pvs)
+          in
+          let generators =
+            (match ft with
+            | [] -> []
+            | _ -> [TermGenerator ([m], ft)])
+            @ kgen              
+          in
+          Binder (Forall, vs, add_generators bvs f, generators @ ann)
+      | f -> f
+    in
+    add_generators IdSet.empty (add_match f)
+  in
+  (* Expands definition of predicate [p] for arguments [ts] assuming polarity of occurrence [pol] *)
   let expand_pred pos p ts =
     let pred = find_pred prog p in
+    let locals = locals_of_pred pred in
+    let formals = formals_of_pred pred in
+    let returns = returns_of_pred pred in
+    let name = name_of_pred pred in
     let sm =
       try
         List.fold_left2 
           (fun sm id t -> IdMap.add id t sm)
-          IdMap.empty (pred.pred_formals @ pred.pred_footprints) ts
+          IdMap.empty formals ts
       with Invalid_argument _ ->
-        failwith ("Fatal error while expanding predicate " ^ string_of_ident pred.pred_name)
+        failwith ("Fatal error while expanding predicate " ^ string_of_ident name)
     in
     let sm =
-      match pred.pred_outputs with
+      match returns with
       | [] -> sm
       | [id] -> 
-          let var = IdMap.find id pred.pred_locals in
+          let var = IdMap.find id locals in
           IdMap.add id (mk_free_fun var.var_sort p ts) sm
       | _ -> failwith "Functions may only have a single return value."
     in
@@ -131,62 +214,82 @@ let add_pred_insts prog f =
             let f1 = expand_neg (Some p_msg) (IdSet.add p seen) p1 in
             annotate (annotate_aux_msg p_msg f1) a1
       | f -> f
-    in 
-    let f1 = expand_neg None IdSet.empty (nnf f) in
-    (*print_endline "f1:";
-    print_form stdout (f1); print_newline (); print_newline ();
-    print_endline "foralls_to_exists f1:";
-    print_form stdout (foralls_to_exists f1); print_newline (); print_newline ();*)
-    propagate_exists (foralls_to_exists f1)
+    in
+    f |>
+    nnf |>
+    expand_neg None IdSet.empty |>
+    (*fun f -> print_endline "before: "; print_form stdout f; print_newline(); f ) |> *)
+    foralls_to_exists |>
+    (*fun f -> print_endline "after: "; print_form stdout f; print_newline(); f ) |> *)
+    propagate_exists_up |>
+    SimplifyGrass.simplify_one_sets |>
+    foralls_to_exists
+    (* |> (fun f -> print_endline "after: "; print_form stdout f; print_newline(); f )*)
   in
-  let vs, f, a = match f_inst with
+  (*let vs, f, a = match f_inst with
   | Binder (Exists, vs, f, a) -> vs, f, a
   | _ -> [], f_inst, []
-  in
+    in*)
   let pred_def pred =
-    let args = pred.pred_formals @ pred.pred_footprints in
+    let locals = locals_of_pred pred in
+    let formals = formals_of_pred pred in
+    let returns = returns_of_pred pred in
+    let name = name_of_pred pred in
     let sorted_vs, sm =
       List.fold_right
         (fun id (sorted_vs, sm) ->
-          let var = IdMap.find id pred.pred_locals in
+          let var = IdMap.find id locals in
           (id, var.var_sort) :: sorted_vs,
           IdMap.add id (Var (id, var.var_sort)) sm
         )
-        args ([], IdMap.empty)
+        formals ([], IdMap.empty)
     in
-    let body = form_of_spec pred.pred_body in
-    let body =
-      match body with
-      | Binder (Forall, vs, BoolOp (And, fs), a) ->
-          List.map (fun f -> Binder (Forall, vs, f, a)) fs
-      | BoolOp (And, fs) ->
-          fs
-      | f -> [f]
+    let defs =
+      List.map
+        (fun f -> f |> form_of_spec |> strip_error_msgs)
+        (pred.pred_body :: postcond_of_pred pred)
+    in
+    let defs =
+      let rec split acc = function
+        | Binder (Forall, vs, BoolOp (And, fs), a) :: ofs ->
+            split acc (List.map (fun f -> Binder (Forall, vs, f, a)) fs @ ofs)
+      | BoolOp (And, fs) :: ofs ->
+          split ofs (fs @ ofs)
+      | f :: ofs -> split (f :: acc) ofs
+      | [] -> List.rev acc
+      in split [] defs
     in
     let vs = List.map (fun (id, srt) -> Var (id, srt)) sorted_vs in
-    let sm, body =
-      match pred.pred_outputs with
-      | [] -> sm, List.map (fun f -> mk_implies (mk_pred pred.pred_name vs) f) body
+    let sm, defs =
+      match returns with
+      | [] -> sm, List.map (fun f -> mk_implies (mk_pred name vs) f) defs
       | [id] -> 
-          let var = IdMap.find id pred.pred_locals in
-          IdMap.add id (mk_free_fun var.var_sort pred.pred_name vs) sm, body
+          let var = IdMap.find id locals in
+          IdMap.add id (mk_free_fun var.var_sort name vs) sm, defs
       | _ -> failwith "Functions may only have a single return value."
     in
-    let cnt = ref 0 in
     let annot () =
-      let i = !cnt in
-      cnt := i+1;
-      Name ("definition_of_" ^ (string_of_ident pred.pred_name), i)
+      Name (fresh_ident @@ "definition_of_" ^ (string_of_ident name))
     in
     let pat =
-      match pred.pred_outputs with
-      | [] -> [Pattern (mk_known (mk_free_fun Bool pred.pred_name vs), [])]
+      match returns with
+      | [] -> [Pattern (mk_known (mk_free_fun Bool name vs), [])]
       | _ -> []
     in
-    List.map (fun f -> smk_forall ~ann:(annot () :: pat) sorted_vs (subst_consts sm f)) body
+    List.map (fun f ->
+      f |>
+      subst_consts sm |>
+      smk_forall ~ann:(annot () :: pat) sorted_vs |>
+      skolemize |>
+      (*propagate_forall |>*)
+      annotate_term_generators pred)
+      defs
+      (*(fun fs -> print_forms stdout fs; print_newline (); fs)*)
   in
   let pred_defs = Prog.fold_preds (fun acc pred -> pred_def pred @ acc) [] prog in
-  let f = mk_exists ~ann:a vs (smk_and (f :: pred_defs)) in
+  let f = (*mk_exists ~ann:a vs (smk_and (f :: pred_defs))*)
+    smk_and (f_inst :: pred_defs)
+  in
   f
         
 (** Generate verification conditions for procedure [proc] of program [prog]. 
@@ -202,6 +305,7 @@ let vcgen prog proc =
         match sf.spec_form with FOL f -> [mk_name name f] | SL _ -> [])
       prog.prog_axioms
   in
+  let proc_name = name_of_proc proc in
   let rec vcs acc pre = function
     | Loop _ -> 
         failwith "vcgen: loop should have been desugared"
@@ -240,7 +344,7 @@ let vcgen prog proc =
               | None -> 
                   "Possible assertion violation.", 
                   ProgError.mk_error_info "This is the assertion that might be violated"
-              | Some msg -> msg proc.proc_name
+              | Some msg -> msg proc_name
             in 
             let vc_msg = (vc_msg, pp.pp_pos) in
             let f =
@@ -253,7 +357,7 @@ let vcgen prog proc =
             in
             let vc_name = 
               Str.global_replace (Str.regexp " ") "_"
-                (string_of_ident proc.proc_name ^ "_" ^ name)
+                (string_of_ident proc_name ^ "_" ^ name)
             in
             let vc = pre @ [mk_name name f] in
             let vc_and_preds = add_pred_insts prog (smk_and vc) in
@@ -325,7 +429,7 @@ let check_proc prog proc =
       end
     in check_one vc0
   in
-  let _ = Debug.info (fun () -> "Checking procedure " ^ string_of_ident proc.proc_name ^ "...\n") in
+  let _ = Debug.info (fun () -> "Checking procedure " ^ string_of_ident (name_of_proc proc) ^ "...\n") in
   let vcs = vcgen prog proc in
   List.fold_left check_vc [] vcs
 
@@ -425,7 +529,7 @@ let get_trace prog proc (pp, model) =
       match v1, v2 with
       | Some v1, _ -> Some v1
       | _, Some v2 -> Some v2
-      | _, _ -> None) prog.prog_vars proc.proc_locals
+      | _, _ -> None) prog.prog_vars (locals_of_proc proc)
     in
     IdMap.fold 
       (fun (name, num) _ vmap -> 

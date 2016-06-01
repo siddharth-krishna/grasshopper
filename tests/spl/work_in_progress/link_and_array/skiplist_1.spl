@@ -3,7 +3,7 @@
 //  under CC-BY
 //  full source at http://opendatastructures.org/ods-java.tgz
 
-include "../include/skiplist.spl";
+include "../../include/skiplist.spl";
 
 procedure findPredNode(this: SkipList, x: Int) 
   returns (res: Node)
@@ -93,7 +93,7 @@ procedure add(this: SkipList, x: Int)
   }
 
   //a ghost map that remember the values of stack[i].next[j]
-  pure assume(forall i: Int, j: Int:: i >= 0 && i <= w.next.length && j >= 0 && j <= stack[i].next.length ==> ghostWitness(i,j) == stack[i].next[j])
+  pure assume(forall i: Int, j: Int:: i >= 0 && i <= w.next.length && j >= 0 && j <= stack[i].next.length ==> ghostWitness(i,j) == stack[i].next[j]);
 
   var i: Int := 0;
   while (i < w.next.length)

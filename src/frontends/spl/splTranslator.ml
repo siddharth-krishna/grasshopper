@@ -27,7 +27,10 @@ let make_conditionals_lazy cu =
     aux_id, locals1
   in
   let rec process_stmt scope locals = function
-    | If (BinaryOp(e1, OpOr, e2, _, p1), s1, s2, p2) -> If (e1, s1, If (e2, s1, s2, p1), p2), locals
+    | If (BinaryOp(e1, OpOr, e2, _, p1), s1, s2, p2) ->
+        If (e1, s1, If (e2, s1, s2, p1), p2), locals
+    | If (BinaryOp (e1, OpImpl, e2, _, p1), s1, s2, p2) ->
+        If (UnaryOp (OpNot, e1, p1), s1, If (e2, s1, s2, p1), p2), locals
     | Loop (invs, preb, BinaryOp (e1, OpOr, e2, _, pos1), postb, pos) ->
        let aux_id, locals = decl_aux_var "loop_cond" BoolType pos scope locals
        in
@@ -92,6 +95,7 @@ let convert cu =
   in
   let convert_type ty pos =
     let rec ct = function
+      | IdentType id -> FreeSrt id
       | StructType id -> Loc (FreeSrt id)
       | AnyRefType -> Loc (FreeSrt ("Null", 0))
       | MapType (dtyp, rtyp) -> Map (ct dtyp, ct rtyp)
@@ -142,31 +146,37 @@ let convert cu =
         let tmap = convert_term locals map in
         let tidx = convert_term locals idx in
         GrassUtil.mk_read tmap tidx
-    | Old (e, pos) ->
+    | UnaryOp (OpOld, e, pos) ->
         let t = convert_term locals e in
-        oldify_term globals t
-    | Length (e, pos) ->
+        GrassUtil.mk_old t
+    | UnaryOp (OpLength, e, pos) ->
         let t = convert_term locals e in
         GrassUtil.mk_length t
-    | ArrayOfCell (e, pos) ->
+    | UnaryOp (OpArrayOfCell, e, pos) ->
         let t = convert_term locals e in
         GrassUtil.mk_array_of_cell t
-    | IndexOfCell (e, pos) ->
+    | UnaryOp (OpIndexOfCell, e, pos) ->
         let t = convert_term locals e in
         GrassUtil.mk_index_of_cell t
-    | ArrayCells (e, pos) ->
+    | UnaryOp (OpArrayCells, e, pos) ->
         let t = convert_term locals e in
         GrassUtil.mk_array_cells t
     | PredApp (Pred id, es, pos) ->
         let decl = IdMap.find id cu.pred_decls in
-        let ts = List.map (convert_term locals) es in 
+        let ts = List.map (convert_term locals) es in
         (match decl.pr_outputs with
         | [res] ->
             let res_decl = IdMap.find res decl.pr_locals in
             let res_srt = convert_type res_decl.v_type pos in
             GrassUtil.mk_free_fun res_srt id ts
         | [] ->
-            GrassUtil.mk_free_fun Bool id ts
+            let res_ty =
+              decl.pr_body |>
+              Opt.map (type_of_expr cu decl.pr_locals) |>
+              Opt.get_or_else BoolType
+            in
+            let res_srt = convert_type res_ty pos in
+            GrassUtil.mk_free_fun res_srt id ts
         | _ -> failwith "unexpected expression")
     | BinaryOp (e1, (OpDiff as op), e2, ty, _)
     | BinaryOp (e1, (OpUn as op), e2, ty, _)      
@@ -181,20 +191,15 @@ let convert cu =
         let t1 = convert_term locals e1 in
         let t2 = convert_term locals e2 in
         mk_app t1 t2
-    | BinaryOp (e1, (OpMinus as op), e2, ty, _)
-    | BinaryOp (e1, (OpPlus as op), e2, ty, _)
-    | BinaryOp (e1, (OpMult as op), e2, ty, _)
-    | BinaryOp (e1, (OpDiv as op), e2, ty, _)
-    | BinaryOp (e1, (OpBvAnd as op), e2, ty, _)
-    | BinaryOp (e1, (OpBvOr as op), e2, ty, _)
-    | BinaryOp (e1, (OpBvShiftL as op), e2, ty, _)
-    | BinaryOp (e1, (OpBvShiftR as op), e2, ty, _) ->
+    | BinaryOp (e1, ((OpMinus | OpPlus | OpMult | OpDiv | OpMod) as op), e2, ty, _)
+    | BinaryOp (e1, ((OpBvAnd | OpBvOr | OpBvShiftL | OpBvShiftR) as op), e2, ty, _)  ->
         let mk_app =
           match op with
           | OpMinus -> GrassUtil.mk_minus
           | OpPlus -> GrassUtil.mk_plus
           | OpMult -> GrassUtil.mk_mult
           | OpDiv -> GrassUtil.mk_div
+          | OpMod -> GrassUtil.mk_mod
           | OpBvAnd -> GrassUtil.mk_bv_and
           | OpBvOr -> GrassUtil.mk_bv_or
           | OpBvShiftL -> GrassUtil.mk_bv_shift_left
@@ -204,15 +209,15 @@ let convert cu =
         let t1 = convert_term locals e1 in
         let t2 = convert_term locals e2 in
         mk_app t1 t2
-    | UnaryOp (OpPlus, e, _) ->
+    | UnaryOp (OpUPlus, e, _) ->
         convert_term locals e
-    | UnaryOp (OpMinus as op, e, _)
+    | UnaryOp (OpUMinus as op, e, _)
     | UnaryOp (OpBvNot as op, e, _)
     | UnaryOp (OpToInt as op, e, _)
     | UnaryOp (OpToByte as op, e, _) ->
         let t = convert_term locals e in
         let mk_app = match op with
-          | OpMinus  -> GrassUtil.mk_uminus
+          | OpUMinus  -> GrassUtil.mk_uminus
           | OpBvNot  -> GrassUtil.mk_bv_not
           | OpToInt  -> GrassUtil.mk_byte_to_int
           | OpToByte -> GrassUtil.mk_int_to_byte
@@ -274,16 +279,16 @@ let convert cu =
         in
         let (vars, (domains, locals1)) =
           Util.fold_left_map
-            (fun (accD,accL) decl -> match decl with
+            (fun (accD, accL) decl -> match decl with
               | GuardedVar (id, e) ->
                 let e1 = convert_term accL e in
-                (match type_of_expr cu locals e with
+                (match type_of_expr cu accL e with
                 | SetType elem_srt ->
                   let decl = var_decl id elem_srt false false pos pos in
                   let elem_srt = convert_type elem_srt pos in
                   let v_id = GrassUtil.mk_var elem_srt id in
                   (id, elem_srt), ((GrassUtil.mk_elem v_id e1) :: accD, IdMap.add id decl accL)
-                | _ -> failwith "unexpected type")
+                | ty -> failwith "unexpected type after type inference" (*type_error (pos_of_expr e) (SetType AnyType) ty*))
               | UnguardedVar decl ->
                 let id = decl.v_name in
                 let ty = decl.v_type in
@@ -375,8 +380,9 @@ let convert cu =
            
         in*)
         let matches = 
-          List.map (fun (e, filters) -> 
+          List.fold_right (fun (e, filters) matches -> 
             let ce = GrassUtil.free_consts_term e in
+            let ce_srts = GrassUtil.sign_term e in
             let ce_occur_below ts =
               List.exists 
                 (function App (FreeSym id, [], _) -> IdSet.mem id ce | _ -> false)
@@ -388,19 +394,30 @@ let convert cu =
                   t <> e && List.exists ce_occur_below ts
               | _ -> false
             in*)
-            let flt = 
+            let flt, aux_matches = 
               TermSet.fold 
-                (fun t acc -> match t with
+                (fun t (flt, aux_matches) -> match t with
                 | App (FreeSym sym, (_ :: _ as ts), _)
                   when symbol_of e <> Some (FreeSym sym) && ce_occur_below ts ->
-                    (FilterSymbolNotOccurs (FreeSym sym)) :: acc
-                | App (Read, (App (FreeSym sym, [], srt) :: _ as ts), _)
+                    (FilterSymbolNotOccurs (FreeSym sym)) :: flt, aux_matches
+                | App (Read, ([App (FreeSym sym, [], srt); l] as ts), _)
                   when symbol_of e <> Some (FreeSym sym) && ce_occur_below ts ->
-                    (FilterReadNotOccurs (GrassUtil.name sym, ([], srt))) :: acc
-                | _ -> acc)
-                gts (FilterNotNull :: filters)
+                    (FilterReadNotOccurs (GrassUtil.name sym, ([], srt))) :: flt,
+                    Match (l, [FilterNotNull]) :: aux_matches
+                | _ -> flt, aux_matches)
+                gts (filters, [])
             in
-            Match (e, flt)) es1
+            (*let aux_matches =
+              IdSet.fold
+                (fun id aux_matches ->
+                  let srt = SymbolMap.find (FreeSym id) ce_srts in
+                  match srt with
+                  | ([], (Int | Loc _ as rsrt)) ->
+                      Match (GrassUtil.mk_known (GrassUtil.mk_free_const rsrt id), []) :: aux_matches
+                  | _ -> aux_matches
+                ) ce aux_matches
+            in*)
+            Match (e, flt) :: aux_matches @ matches) es1 []
         in
         GrassUtil.annotate f [TermGenerator (matches, [ge1])]
     | e ->
@@ -437,6 +454,12 @@ let convert cu =
         let f1 = convert_sl_form locals e1 in
         let f2 = convert_sl_form locals e2 in
         mk_op ~pos:pos op f1 f2
+    | BinaryOp (e1, OpImpl, e2, PermType, pos) ->
+        let f1 = convert_grass_form locals e1 in
+        let f2 = convert_sl_form locals e2 in
+        SlUtil.mk_or
+          (Pure (GrassUtil.mk_not f1, Some pos))
+          (SlUtil.mk_sep_star (Pure (f1, Some pos)) f2)
     | BinaryOp (e1, (OpAnd as op), e2, PermType, _)
     | BinaryOp (e1, (OpOr as op), e2, PermType, _) ->
         let f1 = convert_sl_form locals e1 in
@@ -591,103 +614,109 @@ let convert cu =
           mk_return_cmd ts pos
       | _ -> failwith "unexpected statement"
   in
-  let prog =
-    IdMap.fold 
-      (fun id decl prog ->
-        let body = convert_grass_form decl.pr_locals decl.pr_body in
-        let locals = IdMap.map convert_var_decl decl.pr_locals in
-        let fun_terms f =
-          let rec ft acc = function
-            | App (sym, _ :: _, srt) as t when GrassUtil.is_free_symbol sym || srt <> Bool ->
-                if IdSet.is_empty (GrassUtil.fv_term t)
-                then TermSet.add t acc else acc
-            | App (_, ts, _) ->
-                List.fold_left ft acc ts
-            | _ -> acc
-          in
-          GrassUtil.fold_terms ft TermSet.empty f
-        in
-        let sorted_vs =
-          List.map
-            (fun x ->
-              let var = IdMap.find x locals in
-              x, var.var_sort)
-            (decl.pr_formals @ decl.pr_footprints)
-        in
-        let vs = List.map (fun (x, srt) -> GrassUtil.mk_free_const srt x) sorted_vs in
-        let m, kgen = match decl.pr_outputs with
-        | [] ->
-            let mt = GrassUtil.mk_free_fun Bool id vs in
-            let m = Match (mt, []) in
-            m, [TermGenerator ([m], [GrassUtil.mk_known mt])]
-        | [x] ->
-            let var = IdMap.find x locals in
-            Match (GrassUtil.mk_free_fun var.var_sort id vs, []), []
-        | _ -> failwith "Functions may only have a single return value."
-        in
-        let rec add_match = function
-          | Grass.Binder (b, vs, f, annots) ->
-              let annots1 =
-                List.map (function TermGenerator (ms, ts) -> TermGenerator (m :: ms, ts) | a -> a) annots
-              in
-              Grass.Binder (b, vs, add_match f, annots1)
-          | BoolOp (op, fs) ->
-              BoolOp (op, List.map add_match fs)
-          | f -> f
-        in
-        let rec add_generators f =
-          match f with
-          | BoolOp (And, fs) ->
-              BoolOp (And, List.map add_generators fs)
-          | _ ->
-              let ft = fun_terms f in
-              let generators =
-                (if TermSet.is_empty ft then []
-                else [TermGenerator ([m], TermSet.elements ft)])
-                @ kgen              
-              in
-              GrassUtil.annotate f generators
-        in
-        let body = add_generators (add_match body) in
-        let pred_decl = 
-          { pred_name = id;
-            pred_formals = decl.pr_formals;
-            pred_outputs = decl.pr_outputs;
-            pred_footprints = decl.pr_footprints;
-            pred_locals = locals;
-            pred_body = mk_spec_form (FOL body) (string_of_ident id) None (pos_of_expr decl.pr_body);
-            pred_pos = decl.pr_pos;
-            pred_accesses = IdSet.empty;
-            pred_is_footprint = decl.pr_is_footprint;
-          }
-        in
-        declare_pred prog pred_decl
-      )
-      cu.pred_decls prog
-  in
-  let convert_contract proc_name locals contract =
+  (* Convert contracts *)
+  let convert_contract name locals contract =
     List.fold_right 
       (function 
         | Requires (e, pure) -> fun (pre, post) -> 
             let mk_msg caller =
               Printf.sprintf 
                 "A precondition for this call of %s might not hold"
-                (string_of_ident proc_name),
+                (string_of_ident name),
               ProgError.mk_error_info "This is the precondition that might not hold"
             in
-            let name = "precondition of " ^ string_of_ident proc_name in
+            let name = "precondition of " ^ string_of_ident name in
             convert_spec_form pure locals e name (Some mk_msg) :: pre, post
         | Ensures (e, pure) -> fun (pre, post) ->
             let mk_msg caller =
               Printf.sprintf 
-                "A postcondition of procedure %s might not hold at this return point"
-                (string_of_ident proc_name),
+                "A postcondition of %s might not hold at this return point"
+                (string_of_ident name),
               ProgError.mk_error_info "This is the postcondition that might not hold"
             in 
-            let name = "postcondition of " ^ string_of_ident proc_name in
+            let name = "postcondition of " ^ string_of_ident name in
             pre, convert_spec_form pure locals e name (Some mk_msg) :: post)
       contract ([], [])
   in
+  (* Convert predicates *)
+  let prog =
+    IdMap.fold 
+      (fun id decl prog ->
+        let pre, post = convert_contract decl.pr_name decl.pr_locals decl.pr_contracts in
+        let rtype =
+          decl.pr_body |>
+          Opt.map (type_of_expr cu decl.pr_locals) |>
+          Opt.get_or_else BoolType
+        in
+        let body, locals, outputs =
+          match rtype with
+          | BoolType ->
+              let body = Opt.get_or_else (BoolVal (true, decl.pr_pos)) decl.pr_body in
+              let cbody = convert_grass_form decl.pr_locals body in
+              SL (Pure (cbody, Some (pos_of_expr body))), decl.pr_locals, decl.pr_outputs              
+          | PermType ->
+              let body = Opt.get_or_else (BoolVal (true, decl.pr_pos)) decl.pr_body in
+              SL (convert_sl_form decl.pr_locals body), decl.pr_locals, decl.pr_outputs
+          | rtype ->
+              let ret_id, locals =
+                match decl.pr_outputs with
+                | [r] -> r, decl.pr_locals
+                | _ ->
+                    let res_id = GrassUtil.fresh_ident "res" in
+                    let rdecl = 
+                      { v_name = res_id;
+                        v_type = rtype;
+                        v_ghost = false;
+                        v_implicit = false;
+                        v_aux = true;
+                        v_pos = decl.pr_pos;
+                        v_scope = decl.pr_pos;
+                      }
+                    in
+                    res_id, IdMap.add res_id rdecl decl.pr_locals
+              in
+              let r = Ident (ret_id, decl.pr_pos) in
+              let body = match decl.pr_body with
+              | Some (Binder (SetComp, vs, f, pos)) ->
+                  let v_decl =
+                    match vs with
+                    | [UnguardedVar decl] -> decl
+                    | _ -> failwith "unexpected set comprehension"
+                  in
+                  let v = Ident (v_decl.v_name, v_decl.v_pos) in
+                  Binder (Forall, [UnguardedVar v_decl], BinaryOp (BinaryOp (v, OpIn, r, BoolType, pos), OpEq, f, BoolType, pos), pos)
+              | Some e ->
+                  BinaryOp (r, OpEq, e, BoolType, pos_of_expr e)
+              | None -> BoolVal (true, decl.pr_pos)
+              in
+              FOL (convert_grass_form locals body), locals, [ret_id]
+        in
+        let locals = IdMap.map convert_var_decl locals in
+        let body_pos =
+          Opt.map pos_of_expr decl.pr_body |> Opt.get_or_else decl.pr_pos
+        in
+        let contract =
+          { contr_name = id;
+            contr_formals = decl.pr_formals;
+            contr_returns = outputs;
+            contr_footprint_sorts = SortSet.empty;
+            contr_locals = locals;
+            contr_precond = pre;
+            contr_postcond = post;
+            contr_pos = decl.pr_pos;
+         }
+        in
+        let pred_decl = 
+          { pred_contract = contract;
+            pred_body = mk_spec_form body (string_of_ident id) None body_pos;
+            pred_accesses = IdSet.empty;
+          }
+        in
+        declare_pred prog pred_decl
+      )
+      cu.pred_decls prog
+  in
+  (* Convert procedures *)
   let convert_body decl =
     match decl.p_body with
     | Skip _ -> None
@@ -697,15 +726,20 @@ let convert cu =
     IdMap.fold
       (fun id decl prog ->
         let pre, post = convert_contract decl.p_name decl.p_locals decl.p_contracts in
+        let proc_contract =
+          { contr_name = id;
+            contr_formals = decl.p_formals;
+            contr_footprint_sorts = SortSet.empty;
+            contr_returns = decl.p_returns;
+            contr_locals = IdMap.map convert_var_decl decl.p_locals;
+            contr_precond = pre;
+            contr_postcond = post;
+            contr_pos = decl.p_pos;
+          }
+        in
         let proc_decl =
-          { proc_name = id;
-            proc_formals = decl.p_formals;
-            proc_returns = decl.p_returns;
-            proc_locals = IdMap.map convert_var_decl decl.p_locals;
-            proc_precond = pre;
-            proc_postcond = post;
+          { proc_contract = proc_contract;
             proc_body = convert_body decl;
-            proc_pos = decl.p_pos;
             proc_deps = [];
             proc_is_tailrec = false;
           } 
@@ -714,6 +748,7 @@ let convert cu =
       )
       cu.proc_decls prog
   in
+  (* Convert axioms *)
   let prog = 
     let specs =
       List.map

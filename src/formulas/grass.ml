@@ -65,11 +65,12 @@ type symbol =
   | IntConst of Int64.t
   (* interpreted function symbols *)
   | Null | Read | Write | EntPnt
-  | UMinus | Plus | Minus | Mult | Div  (* Int *)
+  | UMinus | Plus | Minus | Mult | Div | Mod (* Int *)
   | BitAnd | BitOr | BitNot | ShiftLeft | ShiftRight (* Bit Vector *)
   | Empty | SetEnum | Union | Inter | Diff  (* Set *)
   | Length | IndexOfCell | ArrayOfCell | ArrayCells
   | ByteToInt | IntToByte (* explicit conversion *)
+  | Ite (* if-then-else *)
   (* interpreted predicate symbols *)
   | Eq
   | LtEq | GtEq | Lt | Gt
@@ -77,18 +78,22 @@ type symbol =
   | Elem | SubsetEq | Disjoint
   (* uninterpreted constants, functions, and predicates *)
   | FreeSym of ident
+  (* oldification *)
+  | Old      
   (* for patterns *)
   | Known
 
 let symbols = 
   [BoolConst true; BoolConst false; 
    Null; Read; Write; EntPnt;
-   UMinus; Plus; Minus; Mult; Div;
+   UMinus; Plus; Minus; Mult; Div; Mod;
    BitAnd; BitOr; BitNot; ShiftLeft; ShiftRight;
    Empty; SetEnum; Union; Inter; Diff;
    Length; IndexOfCell; ArrayOfCell; ArrayCells;
+   Ite;
    Eq; LtEq; GtEq; Lt; Gt;
-   Btwn; Frame; Elem; SubsetEq; Disjoint; Known]
+   Btwn; Frame; Elem; SubsetEq; Disjoint;
+   Known; Old]
 
 module SymbolSet = Set.Make(struct
     type t = symbol
@@ -223,6 +228,7 @@ let string_of_symbol = function
   | Minus -> "-"
   | Mult -> "*"
   | Div -> "div"
+  | Mod -> "mod"
   | Empty -> "emptyset"
   | SetEnum -> "singleton"
   | Union -> "union"
@@ -235,6 +241,7 @@ let string_of_symbol = function
   | ShiftRight -> ">>"
   | ByteToInt -> "toInt"
   | IntToByte -> "toByte"
+  | Ite -> "ite"
   (* predicate symbols *)
   | Eq -> "="
   | LtEq -> "<="
@@ -248,6 +255,8 @@ let string_of_symbol = function
   | Frame -> "Frame"
   (* uninterpreted symbols *)
   | FreeSym id -> string_of_ident id
+  (* oldification *)
+  | Old -> "old"      
   (* patterns *)
   | Known -> "known"
         
@@ -324,6 +333,7 @@ and pr_term ppf = function
   | App (Plus, [t1; t2], _) -> fprintf ppf "%a + @[<2>%a@]" pr_term0 t1 pr_term0 t2
   | App (Mult, [t1; t2], _) -> fprintf ppf "%a * @[<2>%a@]" pr_term0 t1 pr_term0 t2
   | App (Div, [t1; t2], _) -> fprintf ppf "%a / @[<2>%a@]" pr_term0 t1 pr_term0 t2
+  | App (Mod, [t1; t2], _) -> fprintf ppf "%a % @[<2>%a@]" pr_term0 t1 pr_term0 t2
   | App (Diff, [t1; t2], _) -> fprintf ppf "%a -- @[<2>%a@]" pr_term0 t1 pr_term0 t2
   | App (Length, [t], _) -> fprintf ppf "%a.%s" pr_term t (string_of_symbol Length)
   | App (ArrayCells, [t], _) -> fprintf ppf "%a.%s" pr_term t (string_of_symbol ArrayCells)
@@ -430,6 +440,8 @@ and pr_annot ppf a =
               string_of_symbol sym :: ids
           | FilterReadNotOccurs (name, _) ->
               name :: ids
+          | FilterNotNull ->
+              string_of_symbol Null :: ids
           | _ ->
               ids)
         fs []
